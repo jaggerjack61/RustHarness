@@ -1,0 +1,27 @@
+[package]
+name = "harness-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust port of the Harness OpenAI-compatible coding agent"
+license = "MIT"
+
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+dialoguer = "0.11"
+path-clean = "1.0"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+termimad = "0.34"
+thiserror = "2.0"
+unicode-width = "0.2"
+wait-timeout = "0.2"
+
+[dev-dependencies]
+tempfile = "3.20"
