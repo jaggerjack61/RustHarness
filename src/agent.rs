@@ -92,8 +92,8 @@ struct ProcessedResponse {
 
 pub struct AgentHarness {
     client: Client,
-    api_key: String,
-    base_url: String,
+    endpoints: Vec<ApiEndpoint>,
+    model_endpoint_indices: Option<Vec<usize>>,
     pub model: String,
     pub system_prompt: String,
     pub max_turns: usize,
@@ -108,6 +108,12 @@ pub struct AgentHarness {
     last_prompt_tokens: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ApiEndpoint {
+    api_key: String,
+    base_url: String,
+}
+
 impl AgentHarness {
     pub fn new(config: AgentConfig) -> Result<Self, HarnessError> {
         let client = Client::builder()
@@ -117,12 +123,12 @@ impl AgentHarness {
             .api_key
             .filter(|value| !value.is_empty())
             .or_else(|| env::var("OPENAI_API_KEY").ok())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "sk-placeholder".to_owned());
+            .filter(|value| !value.is_empty());
+        let endpoints = build_endpoints(api_key.as_deref(), &config.base_url);
         Ok(Self {
             client,
-            api_key,
-            base_url: config.base_url.trim_end_matches('/').to_owned(),
+            endpoints,
+            model_endpoint_indices: None,
             model: config.model,
             system_prompt: config.system_prompt,
             max_turns: config.max_turns,
@@ -136,6 +142,16 @@ impl AgentHarness {
             cached_tokens: 0,
             last_prompt_tokens: 0,
         })
+    }
+
+    pub fn select_model(&mut self, model: impl Into<String>, endpoint_indices: Option<Vec<usize>>) {
+        self.model = model.into();
+        let valid_indices = endpoint_indices
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|index| *index < self.endpoints.len())
+            .collect::<Vec<_>>();
+        self.model_endpoint_indices = (!valid_indices.is_empty()).then_some(valid_indices);
     }
 
     pub fn run(&mut self, prompt: &str) -> Result<String, HarnessError> {
@@ -244,12 +260,14 @@ impl AgentHarness {
     }
 
     fn send_with_retry(&self, body: &Value) -> Result<Response, HarnessError> {
-        let endpoint = format!("{}/chat/completions", self.base_url);
         for attempt in 0..=MAX_RETRIES {
+            let endpoint_index = self.endpoint_index_for_attempt(attempt);
+            let provider = &self.endpoints[endpoint_index];
+            let endpoint = format!("{}/chat/completions", provider.base_url);
             let response = self
                 .client
                 .post(&endpoint)
-                .bearer_auth(&self.api_key)
+                .bearer_auth(&provider.api_key)
                 .json(body)
                 .send()
                 .map_err(HarnessError::Transport)
@@ -266,6 +284,13 @@ impl AgentHarness {
             }
         }
         unreachable!("retry loop always returns")
+    }
+
+    fn endpoint_index_for_attempt(&self, attempt: usize) -> usize {
+        self.model_endpoint_indices
+            .as_ref()
+            .map(|indices| indices[attempt % indices.len()])
+            .unwrap_or(attempt % self.endpoints.len())
     }
 
     fn handle_tool_calls(
@@ -519,6 +544,39 @@ impl AgentHarness {
             .map(|payload| payload.len() as u64 / 4)
             .unwrap_or(0)
     }
+}
+
+pub(crate) fn split_multi(value: Option<&str>) -> Vec<String> {
+    value
+        .into_iter()
+        .flat_map(|value| value.split(";;"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn build_endpoints(api_key: Option<&str>, base_url: &str) -> Vec<ApiEndpoint> {
+    let mut keys = split_multi(api_key);
+    if keys.is_empty() {
+        keys.push("sk-placeholder".to_owned());
+    }
+    let urls = split_multi(Some(base_url));
+    let count = keys.len().max(urls.len()).max(1);
+
+    (0..count)
+        .map(|index| ApiEndpoint {
+            api_key: keys
+                .get(index)
+                .unwrap_or_else(|| keys.last().expect("at least one API key"))
+                .clone(),
+            base_url: urls
+                .get(index)
+                .or_else(|| urls.last())
+                .map(|url| url.trim_end_matches('/').to_owned())
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn api_response(response: Response) -> Result<Response, HarnessError> {
@@ -941,5 +999,51 @@ mod tests {
         assert_eq!(config.max_turns, 1_000);
         assert_eq!(config.context_window, 1_000_000);
         assert!(config.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn multi_keys_and_urls_are_paired_and_reuse_last_value() {
+        let endpoints = build_endpoints(
+            Some(" key-one ;; key-two ;; key-three "),
+            "https://a.example/v1/;; https://b.example/v1 ;; ",
+        );
+
+        assert_eq!(
+            endpoints,
+            vec![
+                ApiEndpoint {
+                    api_key: "key-one".to_owned(),
+                    base_url: "https://a.example/v1".to_owned(),
+                },
+                ApiEndpoint {
+                    api_key: "key-two".to_owned(),
+                    base_url: "https://b.example/v1".to_owned(),
+                },
+                ApiEndpoint {
+                    api_key: "key-three".to_owned(),
+                    base_url: "https://b.example/v1".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn model_selection_keeps_only_valid_provider_indices() {
+        let mut config = AgentConfig::new("old-model");
+        config.api_key = Some("key-one;;key-two".to_owned());
+        config.base_url = "https://a.example/v1;;https://b.example/v1".to_owned();
+        let mut agent = AgentHarness::new(config).unwrap();
+
+        agent.select_model("new-model", Some(vec![1, 99]));
+
+        assert_eq!(agent.model, "new-model");
+        assert_eq!(agent.model_endpoint_indices, Some(vec![1]));
+        assert_eq!(agent.endpoint_index_for_attempt(0), 1);
+        assert_eq!(agent.endpoint_index_for_attempt(3), 1);
+
+        agent.select_model("unmapped-model", None);
+        assert_eq!(agent.endpoint_index_for_attempt(0), 0);
+        assert_eq!(agent.endpoint_index_for_attempt(1), 1);
+        assert_eq!(agent.endpoint_index_for_attempt(2), 0);
     }
 }

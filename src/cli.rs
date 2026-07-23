@@ -1,5 +1,6 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use serde_json::Value;
 use termimad::crossterm::terminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::agent::{AgentConfig, AgentHarness};
+use crate::agent::{AgentConfig, AgentHarness, split_multi};
 use crate::constants::{
     DEFAULT_BASE_URL, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TURNS, DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT, DISPLAY_TRUNCATION_LIMIT, FETCH_TIMEOUT_SECS,
@@ -113,7 +114,25 @@ fn parse_positive_i64(value: &str) -> Result<i64, String> {
 }
 
 pub fn run() -> Result<()> {
+    load_executable_env()?;
     run_with(Cli::parse())
+}
+
+fn load_executable_env() -> Result<()> {
+    let executable = std::env::current_exe().context("could not determine executable path")?;
+    load_executable_env_from(&executable)
+}
+
+fn load_executable_env_from(executable: &Path) -> Result<()> {
+    let env_path = executable
+        .parent()
+        .context("executable path has no parent directory")?
+        .join(".env");
+    match dotenvy::from_path_override(&env_path) {
+        Ok(()) => Ok(()),
+        Err(dotenvy::Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("could not load {}", env_path.display())),
+    }
 }
 
 fn run_with(args: Cli) -> Result<()> {
@@ -223,7 +242,8 @@ fn run_with(args: Cli) -> Result<()> {
                     "Current model",
                 ) && selected != agent.model
                 {
-                    agent.model = selected;
+                    let endpoint_indices = fetcher.endpoint_indices_for(&selected);
+                    agent.select_model(selected, endpoint_indices);
                     println!("✅ Model changed to: {}", agent.model);
                 }
                 continue;
@@ -272,8 +292,11 @@ fn run_with(args: Cli) -> Result<()> {
             _ => {}
         }
 
-        if !model_checked && fetcher.ready() {
-            if let Some(warning) = check_model_available(&agent.model, &fetcher.get()) {
+        if !model_checked && (fetcher.requires_routing() || fetcher.ready()) {
+            let models = fetcher.get();
+            let endpoint_indices = fetcher.endpoint_indices_for(&agent.model);
+            agent.select_model(agent.model.clone(), endpoint_indices);
+            if let Some(warning) = check_model_available(&agent.model, &models) {
                 println!("{warning}\n");
             }
             model_checked = true;
@@ -345,9 +368,10 @@ fn clear_terminal() {
 }
 
 fn check_reasoning_compatibility(base_url: &str, effort: Option<&str>) -> Option<String> {
+    let first_base_url = split_multi(Some(base_url)).into_iter().next();
     effort
         .filter(|effort| NONSTANDARD_REASONING_EFFORTS.contains(effort))
-        .filter(|_| base_url.contains("openai.com"))
+        .filter(|_| first_base_url.is_some_and(|url| url.contains("openai.com")))
         .map(|effort| {
             format!(
                 "⚠️  Reasoning effort '{effort}' is not supported by OpenAI and may cause errors. Use low/medium/high, or switch --base-url to a compatible provider."
@@ -412,47 +436,79 @@ fn format_number(value: u64) -> String {
     output
 }
 
-fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
+#[derive(Clone, Debug, Default)]
+struct ModelCatalog {
+    models: Vec<String>,
+    sources: BTreeMap<String, Vec<usize>>,
+}
+
+fn fetch_models(base_url: &str, api_key: Option<&str>, silent: bool) -> Result<ModelCatalog> {
     let client = Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .build()?;
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let mut request = client.get(url);
-    if let Some(api_key) = api_key {
-        request = request.bearer_auth(api_key);
+    let urls = split_multi(Some(base_url));
+    let keys = split_multi(api_key);
+    let mut models = BTreeSet::new();
+    let mut sources = BTreeMap::<String, Vec<usize>>::new();
+
+    for (index, configured_url) in urls.iter().enumerate() {
+        let url = format!("{}/models", configured_url.trim_end_matches('/'));
+        let mut request = client.get(url);
+        if let Some(key) = keys.get(index).or_else(|| keys.last()) {
+            request = request.bearer_auth(key);
+        }
+        let result = request
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(|response| response.json::<Value>());
+        match result {
+            Ok(value) => {
+                let endpoint_models = value
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|model| model.get("id").and_then(Value::as_str));
+                for model in endpoint_models {
+                    models.insert(model.to_owned());
+                    sources.entry(model.to_owned()).or_default().push(index);
+                }
+            }
+            Err(error) if !silent => {
+                println!("❌ Failed to fetch models from {configured_url}: {error}");
+            }
+            Err(_) => {}
+        }
     }
-    let response = request.send()?.error_for_status()?;
-    let value: Value = response.json()?;
-    let mut models = value
-        .get("data")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_owned))
-        .collect::<Vec<_>>();
-    models.sort();
-    Ok(models)
+
+    Ok(ModelCatalog {
+        models: models.into_iter().collect(),
+        sources,
+    })
 }
 
 #[derive(Clone)]
 struct ModelFetcher {
     base_url: String,
     api_key: Option<String>,
-    state: Arc<(Mutex<Option<Vec<String>>>, Condvar)>,
+    requires_routing: bool,
+    state: Arc<(Mutex<Option<ModelCatalog>>, Condvar)>,
 }
 
 impl ModelFetcher {
     fn new(base_url: String, api_key: Option<String>) -> Self {
+        let requires_routing = split_multi(Some(&base_url)).len() > 1;
         let fetcher = Self {
             base_url,
             api_key,
+            requires_routing,
             state: Arc::new((Mutex::new(None), Condvar::new())),
         };
         let worker = fetcher.clone();
         thread::spawn(move || {
-            let models =
-                fetch_models(&worker.base_url, worker.api_key.as_deref()).unwrap_or_default();
-            worker.store(models);
+            let catalog =
+                fetch_models(&worker.base_url, worker.api_key.as_deref(), true).unwrap_or_default();
+            worker.store(catalog);
         });
         fetcher
     }
@@ -468,22 +524,38 @@ impl ModelFetcher {
                 models.is_none()
             })
             .expect("model state poisoned");
-        models.clone().unwrap_or_default()
+        models
+            .as_ref()
+            .map(|catalog| catalog.models.clone())
+            .unwrap_or_default()
+    }
+
+    fn requires_routing(&self) -> bool {
+        self.requires_routing
+    }
+
+    fn endpoint_indices_for(&self, model: &str) -> Option<Vec<usize>> {
+        self.state
+            .0
+            .lock()
+            .expect("model state poisoned")
+            .as_ref()
+            .and_then(|catalog| catalog.sources.get(model).cloned())
     }
 
     fn refresh(&self) {
-        match fetch_models(&self.base_url, self.api_key.as_deref()) {
-            Ok(models) => self.store(models),
+        match fetch_models(&self.base_url, self.api_key.as_deref(), false) {
+            Ok(catalog) => self.store(catalog),
             Err(error) => {
                 println!("❌ Failed to fetch models: {error}");
-                self.store(Vec::new());
+                self.store(ModelCatalog::default());
             }
         }
     }
 
-    fn store(&self, models: Vec<String>) {
+    fn store(&self, catalog: ModelCatalog) {
         let (lock, ready) = &*self.state;
-        *lock.lock().expect("model state poisoned") = Some(models);
+        *lock.lock().expect("model state poisoned") = Some(catalog);
         ready.notify_all();
     }
 }
@@ -1416,5 +1488,36 @@ mod tests {
         assert!(check_reasoning_compatibility("https://api.openai.com/v1", Some("high")).is_none());
         assert!(check_model_available("missing", &["present".to_owned()]).is_some());
         assert!(check_model_available("missing", &[]).is_none());
+        assert!(
+            check_reasoning_compatibility(
+                "https://other.example/v1;;https://api.openai.com/v1",
+                Some("max")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn executable_env_is_loaded_from_executable_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("harness.exe");
+        std::fs::write(
+            directory.path().join(".env"),
+            "HARNESS_RUST_DOTENV_TEST=from-sidecar\n",
+        )
+        .unwrap();
+
+        load_executable_env_from(&executable).unwrap();
+
+        assert_eq!(
+            std::env::var("HARNESS_RUST_DOTENV_TEST").as_deref(),
+            Ok("from-sidecar")
+        );
+    }
+
+    #[test]
+    fn missing_executable_env_is_optional() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(load_executable_env_from(&directory.path().join("harness.exe")).is_ok());
     }
 }

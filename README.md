@@ -56,6 +56,20 @@ cargo build --release
 The executable is `target/release/harness` (`target\release\harness.exe` on
 Windows).
 
+At startup, Harness loads an optional `.env` from the executable's directory.
+For a release build, place it beside `harness` or `harness.exe`, not in the
+shell's current working directory. Values in this file override inherited
+environment variables, matching the Python launcher's behavior.
+
+```dotenv
+OPENAI_API_KEY=key-for-provider-a;;key-for-provider-b
+HARNESS_BASE_URL=https://provider-a.example/v1;;https://provider-b.example/v1
+```
+
+Multiple keys and URLs are separated by `;;` and paired in order. If one list
+is shorter, its last value is reused. Retryable API failures rotate through
+the configured providers.
+
 ## Run
 
 ```bash
@@ -79,7 +93,7 @@ OpenCode's `kimi-k2.7-code` model:
 ```bash
 harness.exe --model "kimi-k2.7-code" \
   --base-url "https://opencode.ai/zen/go/v1/" \
-  --api-key "sk-fPBvz8XkDa5mVa74TQyuxb1CwcrI3sRIweb0UR1SwPYK8lMcFgupIpEFxuBbgdI7"
+  --api-key "sk-your-api-key"
 ```
 
 The CLI options and environment variables mirror the Python implementation.
@@ -87,8 +101,8 @@ The CLI options and environment variables mirror the Python implementation.
 | CLI option | Environment variable | Description |
 |------------|----------------------|-------------|
 | `-m`, `--model` | `HARNESS_MODEL` | Model name (default `deepseek-v4-pro`) |
-| `-k`, `--api-key` | `OPENAI_API_KEY` | API key |
-| `-u`, `--base-url` | `HARNESS_BASE_URL` | Provider base URL (default `https://api.openai.com/v1`) |
+| `-k`, `--api-key` | `OPENAI_API_KEY` | API key, or multiple keys separated by `;;` |
+| `-u`, `--base-url` | `HARNESS_BASE_URL` | Provider base URL(s), separated by `;;` (default `https://api.openai.com/v1`) |
 | `-d`, `--dir` | — | Working directory |
 | `--max-turns` | `HARNESS_MAX_TURNS` | Maximum tool/response turns (default `1000`) |
 | `--system-prompt` | `HARNESS_PROMPT` | Override the system prompt |
