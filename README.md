@@ -110,6 +110,8 @@ The CLI options and environment variables mirror the Python implementation.
 | `--context-window` | `HARNESS_CONTEXT_WINDOW` | Token context window (default `1_000_000`) |
 | `--stream` / `--no-stream` | — | Force streaming on or off |
 | `--no-markdown` | — | Disable markdown rendering |
+| — | `HARNESS_TLS_INSECURE` | Set to `true` to disable TLS certificate verification for API and model requests |
+| — | `NO_PROXY` | Comma-separated provider hosts that must bypass `HTTP_PROXY`/`HTTPS_PROXY` |
 | — | `HARNESS_SHELL` | Windows shell override (default: `pwsh` if available, otherwise `powershell`) |
 
 ### Interactive commands

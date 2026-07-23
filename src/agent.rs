@@ -40,6 +40,17 @@ impl HarnessError {
     }
 }
 
+pub(crate) fn tls_insecure_enabled() -> bool {
+    env::var("HARNESS_TLS_INSECURE").is_ok_and(|value| true_env_value(&value))
+}
+
+fn true_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
     pub model: String,
@@ -118,6 +129,7 @@ impl AgentHarness {
     pub fn new(config: AgentConfig) -> Result<Self, HarnessError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(600))
+            .danger_accept_invalid_certs(tls_insecure_enabled())
             .build()?;
         let api_key = config
             .api_key
@@ -999,6 +1011,16 @@ mod tests {
         assert_eq!(config.max_turns, 1_000);
         assert_eq!(config.context_window, 1_000_000);
         assert!(config.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn tls_insecure_values_match_python() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(true_env_value(value));
+        }
+        for value in ["", "0", "false", "no", "off"] {
+            assert!(!true_env_value(value));
+        }
     }
 
     #[test]

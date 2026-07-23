@@ -12,7 +12,7 @@ use serde_json::Value;
 use termimad::crossterm::terminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::agent::{AgentConfig, AgentHarness, split_multi};
+use crate::agent::{AgentConfig, AgentHarness, split_multi, tls_insecure_enabled};
 use crate::constants::{
     DEFAULT_BASE_URL, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TURNS, DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT, DISPLAY_TRUNCATION_LIMIT, FETCH_TIMEOUT_SECS,
@@ -235,6 +235,7 @@ fn run_with(args: Cli) -> Result<()> {
                     fetcher.refresh();
                     models = fetcher.get();
                 }
+                fetcher.print_failures();
                 if let Some(selected) = prompt_selection(
                     &models,
                     &agent.model,
@@ -440,16 +441,19 @@ fn format_number(value: u64) -> String {
 struct ModelCatalog {
     models: Vec<String>,
     sources: BTreeMap<String, Vec<usize>>,
+    failures: Vec<String>,
 }
 
-fn fetch_models(base_url: &str, api_key: Option<&str>, silent: bool) -> Result<ModelCatalog> {
+fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<ModelCatalog> {
     let client = Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .danger_accept_invalid_certs(tls_insecure_enabled())
         .build()?;
     let urls = split_multi(Some(base_url));
     let keys = split_multi(api_key);
     let mut models = BTreeSet::new();
     let mut sources = BTreeMap::<String, Vec<usize>>::new();
+    let mut failures = Vec::new();
 
     for (index, configured_url) in urls.iter().enumerate() {
         let url = format!("{}/models", configured_url.trim_end_matches('/'));
@@ -474,17 +478,32 @@ fn fetch_models(base_url: &str, api_key: Option<&str>, silent: bool) -> Result<M
                     sources.entry(model.to_owned()).or_default().push(index);
                 }
             }
-            Err(error) if !silent => {
-                println!("❌ Failed to fetch models from {configured_url}: {error}");
+            Err(error) => {
+                let failure = format!(
+                    "Failed to fetch models from {configured_url}: {}",
+                    error_chain(&error)
+                );
+                failures.push(failure);
             }
-            Err(_) => {}
         }
     }
 
     Ok(ModelCatalog {
         models: models.into_iter().collect(),
         sources,
+        failures,
     })
+}
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        message.push_str(": ");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    message
 }
 
 #[derive(Clone)]
@@ -507,7 +526,7 @@ impl ModelFetcher {
         let worker = fetcher.clone();
         thread::spawn(move || {
             let catalog =
-                fetch_models(&worker.base_url, worker.api_key.as_deref(), true).unwrap_or_default();
+                fetch_models(&worker.base_url, worker.api_key.as_deref()).unwrap_or_default();
             worker.store(catalog);
         });
         fetcher
@@ -543,8 +562,17 @@ impl ModelFetcher {
             .and_then(|catalog| catalog.sources.get(model).cloned())
     }
 
+    fn print_failures(&self) {
+        let state = self.state.0.lock().expect("model state poisoned");
+        if let Some(catalog) = state.as_ref() {
+            for failure in &catalog.failures {
+                println!("❌ {failure}");
+            }
+        }
+    }
+
     fn refresh(&self) {
-        match fetch_models(&self.base_url, self.api_key.as_deref(), false) {
+        match fetch_models(&self.base_url, self.api_key.as_deref()) {
             Ok(catalog) => self.store(catalog),
             Err(error) => {
                 println!("❌ Failed to fetch models: {error}");
