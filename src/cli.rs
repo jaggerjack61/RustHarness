@@ -1,31 +1,38 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, ValueEnum};
-use dialoguer::Password;
+use dialoguer::{Input as TextInput, Password};
 use reqwest::blocking::Client;
 use serde_json::Value;
 use termimad::crossterm::terminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::agent::{AgentConfig, AgentHarness, split_multi, tls_insecure_enabled};
+use crate::agent::{AgentConfig, AgentHarness, HarnessError, split_multi, tls_insecure_enabled};
+use crate::cancel::CancelToken;
 use crate::constants::{
-    DEFAULT_BASE_URL, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TURNS, DEFAULT_MODEL,
-    DEFAULT_REASONING_EFFORT, DISPLAY_TRUNCATION_LIMIT, FETCH_TIMEOUT_SECS,
-    NONSTANDARD_REASONING_EFFORTS, REASONING_OPTIONS,
+    DEFAULT_BASE_URL, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TURNS, DEFAULT_REASONING_EFFORT,
+    DISPLAY_TRUNCATION_LIMIT, FETCH_TIMEOUT_SECS, NONSTANDARD_REASONING_EFFORTS, REASONING_OPTIONS,
 };
 use crate::display::ResponseBuffer;
 use crate::events::Event;
-use crate::markdown::render_markdown;
-use crate::prompts::prompt_selection;
+use crate::input::{Input, Prompt, read_line};
+use crate::keys::KeyListener;
+use crate::markdown::markdown_lines;
+use crate::prompts::{prompt_selection, theme};
 use crate::providers::{self, SavedProvider};
+use crate::ui::{self, BULLET, CROSS, RESULT, SPINNER, THINKING, TICK, Tone, WARN, paint};
 
 const LIVE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+const MAX_DIFF_LINES: usize = 6;
+const MAX_EDITS_SHOWN: usize = 3;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ReasoningEffort {
@@ -55,8 +62,8 @@ impl ReasoningEffort {
     about = "Interactive Nasa Level Genius Agent - chat with an AI that can read, write, edit, and run commands."
 )]
 struct Cli {
-    #[arg(short = 'm', long, env = "HARNESS_MODEL", default_value = DEFAULT_MODEL)]
-    model: String,
+    #[arg(short = 'm', long, env = "HARNESS_MODEL")]
+    model: Option<String>,
 
     #[arg(short = 'k', long, env = "OPENAI_API_KEY")]
     api_key: Option<String>,
@@ -84,10 +91,9 @@ struct Cli {
     #[arg(
         long,
         env = "HARNESS_CONTEXT_WINDOW",
-        default_value_t = DEFAULT_CONTEXT_WINDOW,
         value_parser = parse_positive_i64
     )]
-    context_window: i64,
+    context_window: Option<i64>,
 
     #[arg(long, action = ArgAction::SetTrue, overrides_with = "no_stream")]
     stream: bool,
@@ -144,13 +150,18 @@ fn run_with(args: Cli) -> Result<()> {
         .unwrap_or(std::env::current_dir().context("could not determine current directory")?);
     let provider_path = providers::config_path()?;
     let mut saved_providers = providers::load(&provider_path)?;
-    let mut config = AgentConfig::new(&args.model);
+    let model_path = provider_path.with_file_name("last-model.json");
+    let model = match args.model.clone() {
+        Some(model) => Some(model),
+        None => providers::load_model(&model_path)?,
+    };
+    let mut config = AgentConfig::new(model.unwrap_or_default());
     config.api_key = args.api_key.clone();
     config.base_url = args.base_url.clone();
     config.working_dir = Some(working_dir.clone());
     config.max_turns = args.max_turns;
     config.reasoning_effort = Some(args.reasoning_effort.as_str().to_owned());
-    config.context_window = args.context_window;
+    config.context_window = args.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     if let Some(system_prompt) = args.system_prompt {
         config.system_prompt = system_prompt;
     }
@@ -168,83 +179,109 @@ fn run_with(args: Cli) -> Result<()> {
                 .join(";;"),
         );
     }
+    if config
+        .api_key
+        .as_deref()
+        .is_none_or(|key| key.trim().is_empty())
+        && config.base_url == DEFAULT_BASE_URL
+    {
+        ui::hint("No provider configured. Add one to get started.");
+        let Some((base_url, api_key)) = prompt_login()? else {
+            return Ok(());
+        };
+        saved_providers.insert(
+            0,
+            SavedProvider {
+                base_url: base_url.clone(),
+                api_key: api_key.clone(),
+            },
+        );
+        providers::save(&provider_path, &saved_providers)?;
+        config.base_url = base_url;
+        config.api_key = Some(api_key);
+    }
     let mut agent = AgentHarness::new(config)?;
     let mut use_stream = args.stream || !args.no_stream;
 
-    println!(
-        "{}",
-        build_welcome_box(
-            &agent.model,
-            agent.reasoning_effort.as_deref().unwrap_or("high"),
-            agent.context_window,
-            &working_dir,
-            use_stream,
-        )
-    );
-    println!();
-
     let (base_url, api_key) = agent.provider_config();
     let mut fetcher = ModelFetcher::new(base_url.clone(), api_key);
-    println!("📦 Loading models in background… Use /models to browse.\n");
+    let models = fetcher.get();
+    if agent.model.is_empty() {
+        fetcher.print_failures();
+        anyhow::ensure!(
+            !models.is_empty(),
+            "No models available. Specify a model with --model or check your provider."
+        );
+        let Some(selected) = prompt_selection(&models, "", "Select a model", "Current model")
+        else {
+            return Ok(());
+        };
+        agent.select_model(selected, None);
+    }
+    apply_model_metadata(&mut agent, &fetcher, args.context_window);
+    providers::save_model(&model_path, &agent.model)?;
+    print_banner(&agent, &working_dir, use_stream);
+
     if let Some(warning) =
         check_reasoning_compatibility(&base_url, agent.reasoning_effort.as_deref())
     {
-        println!("{warning}\n");
+        ui::warning(&warning);
+        println!();
     }
 
+    let mut prompt = Prompt::new(Some(provider_path.with_file_name("history")));
     let mut model_checked = false;
+    let mut interrupted = false;
     loop {
-        print!("▸ ");
-        io::stdout().flush()?;
-        let Some(input) = read_line()? else {
-            println!("\nGoodbye!");
-            break;
+        prompt.set_effort(
+            agent
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or(DEFAULT_REASONING_EFFORT),
+        );
+        let input = match prompt.read()? {
+            Input::Line(line) => {
+                interrupted = false;
+                apply_prompt_effort(&mut agent, prompt.effort());
+                line
+            }
+            Input::Interrupted if !interrupted => {
+                interrupted = true;
+                ui::hint("Press Ctrl+C again to quit.");
+                continue;
+            }
+            Input::Interrupted | Input::Eof => break,
         };
         let input = input.trim();
         if input.is_empty() {
             continue;
         }
 
-        match input.to_lowercase().as_str() {
-            "/exit" => {
-                println!("Goodbye!");
-                break;
+        let command = input.to_lowercase();
+        match command.as_str() {
+            "/exit" | "/quit" => break,
+            "/help" => {
+                println!(
+                    "\n{}\n",
+                    ui::help_text(terminal_width().saturating_sub(1), ui::styled())
+                );
+                continue;
             }
             "/clear" => {
                 agent.clear_history();
                 clear_terminal();
-                println!(
-                    "{}\n",
-                    build_welcome_box(
-                        &agent.model,
-                        agent.reasoning_effort.as_deref().unwrap_or("high"),
-                        agent.context_window,
-                        &working_dir,
-                        use_stream,
-                    )
-                );
-                if fetcher.ready() {
-                    let models = fetcher.get();
-                    if models.is_empty() {
-                        println!("⚠️ Could not pre-fetch models — /models will retry on demand.\n");
-                    } else {
-                        println!(
-                            "📦 {} models loaded. Use /models to switch.\n",
-                            models.len()
-                        );
-                    }
-                } else {
-                    println!("📦 Loading models in background… Use /models to browse.\n");
-                }
-                println!("🔄 History cleared.\n");
+                print_banner(&agent, &working_dir, use_stream);
+                ui::success("Conversation cleared.");
+                println!();
                 continue;
             }
             "/stream" => {
                 use_stream = !use_stream;
-                println!(
-                    "✅ Streaming {}.",
-                    if use_stream { "enabled" } else { "disabled" }
-                );
+                ui::success(&format!(
+                    "Streaming {}.",
+                    if use_stream { "on" } else { "off" }
+                ));
+                println!();
                 continue;
             }
             "/login" => {
@@ -259,7 +296,8 @@ fn run_with(args: Cli) -> Result<()> {
                         },
                     );
                     if let Err(error) = providers::save(&provider_path, &updated_providers) {
-                        println!("❌ Could not save provider: {error}");
+                        ui::error(&format!("Could not save provider: {error}"));
+                        println!();
                         continue;
                     }
                     saved_providers = updated_providers;
@@ -267,34 +305,45 @@ fn run_with(args: Cli) -> Result<()> {
                     let (urls, keys) = agent.provider_config();
                     fetcher = ModelFetcher::new(urls, keys);
                     model_checked = false;
-                    println!("✅ Provider saved. Loading models… Use /models to select a model.");
+                    ui::success("Provider saved.");
+                    ui::hint("Loading its models in the background · /models to choose one");
                     if let Some(warning) =
                         check_reasoning_compatibility(&base_url, agent.reasoning_effort.as_deref())
                     {
-                        println!("{warning}");
+                        ui::warning(&warning);
                     }
                 }
+                println!();
                 continue;
             }
-            "/models" => {
+            "/model" | "/models" => {
+                if !fetcher.ready() {
+                    ui::hint("Loading models…");
+                }
                 let mut models = fetcher.get();
                 if models.is_empty() {
-                    println!("\nFetching models…");
+                    ui::hint("Fetching models…");
                     fetcher.refresh();
                     models = fetcher.get();
                 }
                 fetcher.print_failures();
-                if let Some(selected) = prompt_selection(
-                    &models,
-                    &agent.model,
-                    "📋 Available models",
-                    "Current model",
-                ) && selected != agent.model
+                if models.is_empty() {
+                    ui::warning("No models available from the configured providers.");
+                } else if let Some(selected) =
+                    prompt_selection(&models, &agent.model, "Select a model", "Current model")
                 {
-                    let endpoint_indices = fetcher.endpoint_indices_for(&selected);
-                    agent.select_model(selected, endpoint_indices);
-                    println!("✅ Model changed to: {}", agent.model);
+                    agent.select_model(selected, None);
+                    apply_model_metadata(&mut agent, &fetcher, args.context_window);
+                    model_checked = true;
+                    if let Err(error) = providers::save_model(&model_path, &agent.model) {
+                        ui::error(&format!("Could not save model: {error}"));
+                    }
+                    ui::success(&format!(
+                        "Model set to {}.",
+                        ui::style(&agent.model, Tone::Bold)
+                    ));
                 }
+                println!();
                 continue;
             }
             "/reasoning" => {
@@ -302,40 +351,57 @@ fn run_with(args: Cli) -> Result<()> {
                 if let Some(selected) = prompt_selection(
                     REASONING_OPTIONS,
                     current,
-                    "🧠 Reasoning effort",
+                    "Select reasoning effort",
                     "Current effort",
-                ) && Some(selected.as_str()) != agent.reasoning_effort.as_deref()
-                {
-                    agent.reasoning_effort = Some(selected.clone());
-                    println!("✅ Reasoning effort set to: {selected}");
+                ) {
+                    ui::success(&format!(
+                        "Reasoning effort set to {}.",
+                        ui::style(&selected, Tone::Bold)
+                    ));
+                    agent.reasoning_effort = Some(selected);
                 }
+                println!();
                 continue;
             }
             "/context" => {
                 if let Some(context) = read_multiline_context()? {
                     let line_count = context.lines().count();
                     agent.set_custom_context(Some(context));
-                    println!("✅ Custom context set ({line_count} lines).");
+                    ui::success(&format!(
+                        "Custom context set ({line_count} {}).",
+                        plural(line_count, "line")
+                    ));
                 }
+                println!();
                 continue;
             }
             "/context clear" => {
                 agent.clear_custom_context();
-                println!("✅ Custom context cleared.");
+                ui::success("Custom context cleared.");
+                println!();
                 continue;
             }
             "/context show" => {
                 if let Some(context) = agent.get_custom_context() {
+                    let count = context.lines().count();
                     println!(
-                        "\n📋 Current custom context ({} lines):\n{}\n{}\n{}",
-                        context.lines().count(),
-                        "─".repeat(40),
-                        context,
-                        "─".repeat(40)
+                        "\n{} {}",
+                        ui::style("Custom context", Tone::Bold),
+                        ui::style(&format!("· {count} {}", plural(count, "line")), Tone::Muted)
                     );
+                    for line in context.lines() {
+                        println!("{} {line}", ui::style("│", Tone::Muted));
+                    }
                 } else {
-                    println!("No custom context set. Use /context to add one.");
+                    ui::hint("No custom context set. Use /context to add one.");
                 }
+                println!();
+                continue;
+            }
+            _ if is_unknown_command(&command) => {
+                ui::warning(&format!("Unknown command {input}."));
+                ui::hint("Type /help to see all commands.");
+                println!();
                 continue;
             }
             _ => {}
@@ -343,102 +409,194 @@ fn run_with(args: Cli) -> Result<()> {
 
         if !model_checked && (fetcher.requires_routing() || fetcher.ready()) {
             let models = fetcher.get();
-            let endpoint_indices = fetcher.endpoint_indices_for(&agent.model);
-            agent.select_model(agent.model.clone(), endpoint_indices);
+            apply_model_metadata(&mut agent, &fetcher, args.context_window);
             if let Some(warning) = check_model_available(&agent.model, &models) {
-                println!("{warning}\n");
+                ui::warning(&warning);
             }
             model_checked = true;
         }
 
         println!();
-        let mut display = CliDisplay::new(args.no_markdown);
-        let response =
-            agent.run_with_callback(input, use_stream, &mut |event| display.on_event(event));
-        match response {
-            Ok(response) if use_stream => {
-                display.finish();
-                if response.is_empty() && !display.streamed_any {
-                    println!();
-                }
-                println!();
-            }
-            Ok(_) => {
-                display.finish();
-                println!();
-            }
-            Err(error) => {
-                display.discard_preview();
-                println!("\n❌ Error: {error}\n");
-                display.finish();
-            }
-        }
+        let mut display = run_turn(&mut agent, input, use_stream, args.no_markdown);
+        display.complete();
+        println!();
     }
+    ui::hint("Goodbye!");
     Ok(())
 }
 
-fn read_line() -> io::Result<Option<String>> {
-    let mut line = String::new();
-    match io::stdin().read_line(&mut line) {
-        Ok(0) => Ok(None),
-        Ok(_) => Ok(Some(line)),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
-        Err(error) => Err(error),
+/// Hides the terminal cursor so it does not sit on the animated status line.
+struct HiddenCursor;
+
+impl HiddenCursor {
+    fn new() -> Self {
+        print!("\x1b[?25l");
+        let _ = io::stdout().flush();
+        Self
+    }
+}
+
+impl Drop for HiddenCursor {
+    fn drop(&mut self) {
+        print!("\x1b[?25h");
+        let _ = io::stdout().flush();
+    }
+}
+
+/// Adopt a reasoning effort chosen with Tab at the prompt.
+fn apply_prompt_effort(agent: &mut AgentHarness, effort: &str) {
+    if agent.reasoning_effort.as_deref() == Some(effort) {
+        return;
+    }
+    agent.reasoning_effort = Some(effort.to_owned());
+    let (base_url, _) = agent.provider_config();
+    if let Some(warning) = check_reasoning_compatibility(&base_url, Some(effort)) {
+        ui::warning(&warning);
+    }
+}
+
+/// Run one user turn, animating the live region from a ticker thread while the
+/// agent blocks the main thread. Esc (or Ctrl+C) interrupts the turn.
+fn run_turn(agent: &mut AgentHarness, input: &str, stream: bool, no_markdown: bool) -> CliDisplay {
+    let mut display = CliDisplay::new(no_markdown);
+    let animate = display.interactive;
+    let cancel = agent.cancel_token();
+    cancel.reset();
+    let keys = if animate {
+        KeyListener::start(cancel.clone())
+    } else {
+        None
+    };
+    if keys.is_some() {
+        display.cancel = Some(cancel);
+    }
+    let _cursor = animate.then(HiddenCursor::new);
+    let display = Mutex::new(display);
+    let stop = AtomicBool::new(false);
+    let response = thread::scope(|scope| {
+        if animate {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    thread::sleep(SPINNER_INTERVAL);
+                    if !stop.load(Ordering::Relaxed) {
+                        display
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .tick();
+                    }
+                }
+            });
+        }
+        let response = agent.run_with_callback(input, stream, &mut |event| {
+            display
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .on_event(event);
+        });
+        stop.store(true, Ordering::Relaxed);
+        response
+    });
+    drop(keys);
+    let mut display = display.into_inner().unwrap_or_else(PoisonError::into_inner);
+    match response {
+        Ok(_) => {}
+        Err(HarnessError::Cancelled) => display.interrupt(),
+        Err(error) => display.fail(&error.to_string()),
+    }
+    display
+}
+
+fn print_banner(agent: &AgentHarness, working_dir: &Path, streaming: bool) {
+    let info = ui::BannerInfo {
+        model: &agent.model,
+        reasoning_effort: agent.reasoning_effort.as_deref().unwrap_or("high"),
+        context_window: agent.context_window,
+        working_dir,
+        streaming,
+    };
+    println!("{}\n", ui::banner(&info, terminal_width(), ui::styled()));
+}
+
+/// A lone `/word` that is not a known command (paths like `/usr/bin` are not commands).
+fn is_unknown_command(input: &str) -> bool {
+    input.len() > 1
+        && input.starts_with('/')
+        && !input[1..].contains(['/', ' ', '\t', '\n'])
+        && !ui::COMMANDS.iter().any(|(command, _)| *command == input)
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        noun.to_owned()
+    } else {
+        format!("{noun}s")
     }
 }
 
 fn prompt_login() -> Result<Option<(String, String)>> {
-    println!("\nProvider login (press Enter at either prompt to cancel):");
-    print!("Provider base URL: ");
-    io::stdout().flush()?;
-    let Some(url) = read_line()? else {
-        println!("Cancelled.");
-        return Ok(None);
+    println!();
+    ui::hint("Add a provider · leave a field empty to cancel");
+    let interactive = io::stdin().is_terminal();
+    let url = if interactive {
+        TextInput::<String>::with_theme(&theme())
+            .with_prompt("Base URL")
+            .allow_empty(true)
+            .interact_text()
+            .unwrap_or_default()
+    } else {
+        print!("Base URL: ");
+        io::stdout().flush()?;
+        read_line()?.unwrap_or_default()
     };
     if url.trim().is_empty() {
-        println!("Cancelled.");
+        ui::hint("Cancelled.");
         return Ok(None);
     }
     let url = match providers::validate_url(&url) {
         Ok(url) => url,
         Err(error) => {
-            println!("❌ {error}");
+            ui::error(&error.to_string());
             return Ok(None);
         }
     };
-    let key = if io::stdin().is_terminal() {
-        Password::new()
+    let key = if interactive {
+        Password::with_theme(&theme())
             .with_prompt("API key")
             .allow_empty_password(true)
             .report(false)
-            .interact()?
+            .interact()
+            .unwrap_or_default()
     } else {
         print!("API key: ");
         io::stdout().flush()?;
-        let Some(key) = read_line()? else {
-            println!("Cancelled.");
-            return Ok(None);
-        };
-        key
+        read_line()?.unwrap_or_default()
     };
     let key = key.trim();
     if key.is_empty() {
-        println!("Cancelled.");
+        ui::hint("Cancelled.");
         return Ok(None);
     }
     if key.contains(";;") {
-        println!("❌ Enter one API key per /login.");
+        ui::error("Enter one API key per /login.");
         return Ok(None);
     }
     Ok(Some((url, key.to_owned())))
 }
 
 fn read_multiline_context() -> io::Result<Option<String>> {
-    println!("\n📝 Enter custom context (end with '.' on a line by itself):");
+    println!();
+    ui::hint("Paste or type the context. Finish with a line containing only '.'; Ctrl+D cancels.");
+    let gutter = ui::style("│ ", Tone::Muted);
+    let interactive = io::stdin().is_terminal();
     let mut lines = Vec::new();
     loop {
+        if interactive {
+            print!("{gutter}");
+            io::stdout().flush()?;
+        }
         let Some(line) = read_line()? else {
-            println!("\nCancelled.");
+            println!();
+            ui::hint("Cancelled.");
             return Ok(None);
         };
         let line = line.trim_end_matches(['\r', '\n']);
@@ -448,7 +606,7 @@ fn read_multiline_context() -> io::Result<Option<String>> {
         lines.push(line.to_owned());
     }
     if lines.is_empty() {
-        println!("No text entered — context unchanged.");
+        ui::hint("No text entered — context unchanged.");
         Ok(None)
     } else {
         Ok(Some(lines.join("\n")))
@@ -457,7 +615,7 @@ fn read_multiline_context() -> io::Result<Option<String>> {
 
 fn clear_terminal() {
     if io::stdout().is_terminal() {
-        print!("\x1b[2J\x1b[H");
+        print!("\x1b[2J\x1b[3J\x1b[H");
         let _ = io::stdout().flush();
     }
 }
@@ -469,7 +627,7 @@ fn check_reasoning_compatibility(base_url: &str, effort: Option<&str>) -> Option
         .filter(|_| first_base_url.is_some_and(|url| url.contains("openai.com")))
         .map(|effort| {
             format!(
-                "⚠️  Reasoning effort '{effort}' is not supported by OpenAI and may cause errors. Use low/medium/high, or switch --base-url to a compatible provider."
+                "Reasoning effort '{effort}' is not supported by OpenAI and may cause errors. Use low/medium/high, or switch --base-url to a compatible provider."
             )
         })
 }
@@ -477,58 +635,10 @@ fn check_reasoning_compatibility(base_url: &str, effort: Option<&str>) -> Option
 fn check_model_available(model: &str, models: &[String]) -> Option<String> {
     (!models.is_empty() && !models.iter().any(|available| available == model)).then(|| {
         format!(
-            "⚠️  Model '{model}' was not found in the available models list ({} models fetched). Use /models to select a valid model.",
+            "Model '{model}' was not found among the {} available models. Use /models to pick one.",
             models.len()
         )
     })
-}
-
-fn build_welcome_box(
-    model: &str,
-    reasoning_effort: &str,
-    context_window: i64,
-    working_dir: &std::path::Path,
-    streaming: bool,
-) -> String {
-    let lines = vec![
-        "🤖 Nasa Level Genius Agent".to_owned(),
-        format!("Model:           {model}"),
-        format!("Reasoning:       {reasoning_effort}"),
-        format!(
-            "Context window:  {} tokens",
-            format_number(context_window as u64)
-        ),
-        format!("Streaming:       {}", if streaming { "on" } else { "off" }),
-        format!("CWD:             {}", working_dir.display()),
-        "─".repeat(40),
-        "Commands:  /exit  /clear  /login  /models  /reasoning".to_owned(),
-        "           /stream  /context  /context show  /context clear".to_owned(),
-    ];
-    let inner_width = lines
-        .iter()
-        .map(|line| UnicodeWidthStr::width(line.as_str()))
-        .max()
-        .unwrap_or(0)
-        + 4;
-    let mut output = vec![format!("╔{}╗", "═".repeat(inner_width))];
-    for line in lines {
-        let padding = inner_width - 2 - UnicodeWidthStr::width(line.as_str());
-        output.push(format!("║  {line}{}║", " ".repeat(padding)));
-    }
-    output.push(format!("╚{}╝", "═".repeat(inner_width)));
-    output.join("\n")
-}
-
-fn format_number(value: u64) -> String {
-    let digits = value.to_string();
-    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, character) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            output.push(',');
-        }
-        output.push(character);
-    }
-    output
 }
 
 #[derive(Clone, Debug, Default)]
@@ -536,6 +646,38 @@ struct ModelCatalog {
     models: Vec<String>,
     sources: BTreeMap<String, Vec<usize>>,
     failures: Vec<String>,
+    context_windows: BTreeMap<String, i64>,
+}
+
+fn model_context_window(model: &Value) -> Option<i64> {
+    [
+        "/context_window",
+        "/context_length",
+        "/max_context_length",
+        "/max_model_len",
+        "/architecture/context_length",
+        "/top_provider/context_length",
+    ]
+    .into_iter()
+    .filter_map(|path| model.pointer(path))
+    .find_map(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+            .filter(|value| *value > 0)
+    })
+}
+
+fn apply_model_metadata(
+    agent: &mut AgentHarness,
+    fetcher: &ModelFetcher,
+    override_window: Option<i64>,
+) {
+    let endpoint_indices = fetcher.endpoint_indices_for(&agent.model);
+    agent.context_window = override_window
+        .or_else(|| fetcher.context_window_for(&agent.model))
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    agent.select_model(agent.model.clone(), endpoint_indices);
 }
 
 fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<ModelCatalog> {
@@ -548,6 +690,7 @@ fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<ModelCatalog> {
     let mut models = BTreeSet::new();
     let mut sources = BTreeMap::<String, Vec<usize>>::new();
     let mut failures = Vec::new();
+    let mut context_windows = BTreeMap::new();
 
     for (index, configured_url) in urls.iter().enumerate() {
         let url = format!("{}/models", configured_url.trim_end_matches('/'));
@@ -565,11 +708,19 @@ fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<ModelCatalog> {
                     .get("data")
                     .and_then(Value::as_array)
                     .into_iter()
-                    .flatten()
-                    .filter_map(|model| model.get("id").and_then(Value::as_str));
-                for model in endpoint_models {
+                    .flatten();
+                for metadata in endpoint_models {
+                    let Some(model) = metadata.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
                     models.insert(model.to_owned());
                     sources.entry(model.to_owned()).or_default().push(index);
+                    if let Some(window) = model_context_window(metadata) {
+                        context_windows
+                            .entry(model.to_owned())
+                            .and_modify(|existing: &mut i64| *existing = (*existing).min(window))
+                            .or_insert(window);
+                    }
                 }
             }
             Err(error) => {
@@ -586,6 +737,7 @@ fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<ModelCatalog> {
         models: models.into_iter().collect(),
         sources,
         failures,
+        context_windows,
     })
 }
 
@@ -656,11 +808,20 @@ impl ModelFetcher {
             .and_then(|catalog| catalog.sources.get(model).cloned())
     }
 
+    fn context_window_for(&self, model: &str) -> Option<i64> {
+        self.state
+            .0
+            .lock()
+            .expect("model state poisoned")
+            .as_ref()
+            .and_then(|catalog| catalog.context_windows.get(model).copied())
+    }
+
     fn print_failures(&self) {
         let state = self.state.0.lock().expect("model state poisoned");
         if let Some(catalog) = state.as_ref() {
             for failure in &catalog.failures {
-                println!("❌ {failure}");
+                ui::error(failure);
             }
         }
     }
@@ -669,7 +830,7 @@ impl ModelFetcher {
         match fetch_models(&self.base_url, self.api_key.as_deref()) {
             Ok(catalog) => self.store(catalog),
             Err(error) => {
-                println!("❌ Failed to fetch models: {error}");
+                ui::error(&format!("Failed to fetch models: {error}"));
                 self.store(ModelCatalog::default());
             }
         }
@@ -682,208 +843,187 @@ impl ModelFetcher {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Tone {
-    Plain,
-    Blue,
-    Green,
-    Cyan,
-    Yellow,
-    Red,
-    MagentaBold,
-    Bold,
-    Dim,
-}
-
-fn paint(text: &str, tone: Tone, enabled: bool) -> String {
-    if !enabled || matches!(tone, Tone::Plain) {
-        return text.to_owned();
-    }
-    let code = match tone {
-        Tone::Plain => "",
-        Tone::Blue => "34",
-        Tone::Green => "32",
-        Tone::Cyan => "1;36",
-        Tone::Yellow => "33",
-        Tone::Red => "1;31",
-        Tone::MagentaBold => "1;35",
-        Tone::Bold => "1",
-        Tone::Dim => "2",
-    };
-    format!("\x1b[{code}m{text}\x1b[0m")
-}
-
-#[derive(Clone)]
-struct StatusSegment {
-    text: String,
-    tone: Tone,
-}
-
 #[derive(Clone)]
 struct TokenStatus {
     input_tokens: u64,
     output_tokens: u64,
-    total_tokens: u64,
     cached_tokens: u64,
     turn_input: u64,
-    turn_output: u64,
     context_window: i64,
     model: String,
     reasoning_effort: Option<String>,
 }
 
-impl TokenStatus {
-    fn segments(
-        &self,
-        active: bool,
-        include_model: bool,
-        include_context: bool,
-        include_cache: bool,
-        cache_rate: bool,
-        include_reasoning: bool,
-    ) -> Vec<StatusSegment> {
-        let mut parts = vec![StatusSegment {
-            text: if active { "⠿" } else { "📊" }.to_owned(),
-            tone: if active { Tone::Cyan } else { Tone::Bold },
-        }];
-        if include_model {
-            parts.push(StatusSegment {
-                text: self.model.clone(),
-                tone: Tone::MagentaBold,
-            });
-        }
-        parts.extend([
-            StatusSegment {
-                text: format!("In:{}", format_number(self.input_tokens)),
-                tone: Tone::Cyan,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Active,
+    Done,
+    Failed,
+    Interrupted,
+}
+
+/// What the agent is doing right now, shown next to the spinner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Phase {
+    Waiting,
+    Thinking,
+    Writing,
+    Tool(String),
+}
+
+impl Phase {
+    fn label(&self) -> String {
+        match self {
+            Self::Waiting => "Working".to_owned(),
+            Self::Thinking => "Thinking".to_owned(),
+            Self::Writing => "Writing".to_owned(),
+            Self::Tool(name) => match name.as_str() {
+                "bash" => "Running command".to_owned(),
+                "read" => "Reading".to_owned(),
+                "write" => "Writing file".to_owned(),
+                "edit" => "Editing".to_owned(),
+                other => format!("Running {other}"),
             },
-            StatusSegment {
-                text: format!("Out:{}", format_number(self.output_tokens)),
-                tone: Tone::Green,
-            },
-            StatusSegment {
-                text: format!("Tot:{}", format_number(self.total_tokens)),
-                tone: Tone::Bold,
-            },
-        ]);
-        if include_context && self.context_window > 0 {
-            let percentage = self.turn_input as f64 / self.context_window as f64 * 100.0;
-            parts.push(StatusSegment {
-                text: format!("Ctx:{percentage:.1}%"),
-                tone: if percentage < 50.0 {
-                    Tone::Green
-                } else if percentage < 80.0 {
-                    Tone::Yellow
-                } else {
-                    Tone::Red
-                },
-            });
         }
-        if include_cache && self.cached_tokens > 0 {
-            let mut text = format!("Cache:{}", format_number(self.cached_tokens));
-            if cache_rate {
-                let rate = if self.input_tokens > 0 {
-                    self.cached_tokens as f64 / self.input_tokens as f64 * 100.0
-                } else {
-                    0.0
-                };
-                text.push_str(&format!(" ({rate:.1}%)"));
-            }
-            parts.push(StatusSegment {
-                text,
-                tone: Tone::Yellow,
-            });
-        }
-        if include_reasoning && let Some(effort) = self.reasoning_effort.as_deref() {
-            parts.push(StatusSegment {
-                text: format!("🧠 {effort}"),
-                tone: Tone::Dim,
-            });
-        }
-        parts.push(StatusSegment {
-            text: format!(
-                "[+{}/{}]",
-                format_number(self.turn_input),
-                format_number(self.turn_output)
+    }
+}
+
+/// Everything shown on the status line.
+struct StatusInfo<'a> {
+    outcome: Outcome,
+    /// Spinner animation frame.
+    frame: usize,
+    label: &'a str,
+    elapsed_secs: f64,
+    /// Show the "esc to interrupt" hint.
+    interruptible: bool,
+    tokens: Option<&'a TokenStatus>,
+}
+
+/// Render the one-line status: spinner (or outcome), elapsed time, and token stats.
+/// Lower-priority segments are dropped until the line fits in `max_width`.
+fn render_status(info: &StatusInfo<'_>, max_width: usize, styled: bool) -> String {
+    let StatusInfo {
+        outcome,
+        frame,
+        label,
+        elapsed_secs,
+        interruptible,
+        tokens,
+    } = *info;
+    let lead: Vec<(String, Tone)> = match outcome {
+        Outcome::Active => vec![
+            (SPINNER[frame % SPINNER.len()].to_owned(), Tone::Accent),
+            (format!(" {label}…"), Tone::Plain),
+            (
+                format!(" {}", ui::format_duration(elapsed_secs, false)),
+                Tone::Muted,
             ),
-            tone: Tone::Dim,
-        });
-        parts
+        ],
+        Outcome::Done => vec![
+            (TICK.to_owned(), Tone::Success),
+            (
+                format!(" Done in {}", ui::format_duration(elapsed_secs, true)),
+                Tone::Muted,
+            ),
+        ],
+        Outcome::Failed => vec![
+            (CROSS.to_owned(), Tone::Error),
+            (
+                format!(" Failed after {}", ui::format_duration(elapsed_secs, true)),
+                Tone::Muted,
+            ),
+        ],
+        Outcome::Interrupted => vec![
+            ("■".to_owned(), Tone::Warning),
+            (
+                format!(
+                    " Interrupted after {}",
+                    ui::format_duration(elapsed_secs, true)
+                ),
+                Tone::Muted,
+            ),
+        ],
+    };
+
+    // (priority, text, tone): higher priorities are dropped first.
+    let mut segments: Vec<(u8, String, Tone)> = Vec::new();
+    if interruptible && outcome == Outcome::Active {
+        segments.push((2, "esc to interrupt".to_owned(), Tone::Muted));
+    }
+    if let Some(tokens) = tokens {
+        segments.push((
+            1,
+            format!(
+                "↑ {} ↓ {}",
+                ui::compact_number(tokens.input_tokens),
+                ui::compact_number(tokens.output_tokens)
+            ),
+            Tone::Muted,
+        ));
+        if tokens.context_window > 0 {
+            let percentage = tokens.turn_input as f64 / tokens.context_window as f64 * 100.0;
+            let text = if percentage < 10.0 {
+                format!("ctx {percentage:.1}%")
+            } else {
+                format!("ctx {percentage:.0}%")
+            };
+            let tone = if percentage < 50.0 {
+                Tone::Muted
+            } else if percentage < 80.0 {
+                Tone::Warning
+            } else {
+                Tone::Error
+            };
+            segments.push((3, text, tone));
+        }
+        if tokens.cached_tokens > 0 && tokens.input_tokens > 0 {
+            let rate = tokens.cached_tokens as f64 / tokens.input_tokens as f64 * 100.0;
+            segments.push((5, format!("cache {rate:.0}%"), Tone::Muted));
+        }
+        segments.push((4, tokens.model.clone(), Tone::Muted));
+        if let Some(effort) = tokens.reasoning_effort.as_deref() {
+            segments.push((6, effort.to_owned(), Tone::Muted));
+        }
     }
 
-    fn render(&self, max_width: usize, styled: bool, active: bool) -> String {
-        let layouts = [
-            (true, true, true, true, true, "  "),
-            (true, true, true, true, true, " "),
-            (true, true, true, false, true, " "),
-            (true, true, true, false, false, " "),
-            (true, false, true, false, false, " "),
-            (true, false, false, false, false, " "),
-            (false, false, false, false, false, " "),
-        ];
-        let mut chosen = (Vec::new(), " ");
-        for (
-            include_model,
-            include_context,
-            include_cache,
-            cache_rate,
-            include_reasoning,
-            spacing,
-        ) in layouts
-        {
-            let parts = self.segments(
-                active,
-                include_model,
-                include_context,
-                include_cache,
-                cache_rate,
-                include_reasoning,
-            );
-            let width = parts
+    const SEPARATOR: &str = " · ";
+    let lead_width: usize = lead
+        .iter()
+        .map(|(text, _)| UnicodeWidthStr::width(text.as_str()))
+        .sum();
+    let width_of = |segments: &[(u8, String, Tone)]| {
+        lead_width
+            + segments
                 .iter()
-                .map(|part| UnicodeWidthStr::width(part.text.as_str()))
-                .sum::<usize>()
-                + spacing.len() * parts.len().saturating_sub(1);
-            chosen = (parts, spacing);
-            if width <= max_width {
-                break;
-            }
-        }
-        let chosen_width = chosen
-            .0
-            .iter()
-            .map(|part| UnicodeWidthStr::width(part.text.as_str()))
-            .sum::<usize>()
-            + chosen.1.len() * chosen.0.len().saturating_sub(1);
-        if chosen_width > max_width {
-            let icon = StatusSegment {
-                text: if active { "⠿" } else { "📊" }.to_owned(),
-                tone: if active { Tone::Cyan } else { Tone::Bold },
-            };
-            let total = StatusSegment {
-                text: format!("Tot:{}", format_number(self.total_tokens)),
-                tone: Tone::Bold,
-            };
-            let compact_layouts = [vec![icon.clone(), total.clone()], vec![total], vec![icon]];
-            chosen = compact_layouts
-                .into_iter()
-                .find(|parts| {
-                    parts
-                        .iter()
-                        .map(|part| UnicodeWidthStr::width(part.text.as_str()))
-                        .sum::<usize>()
-                        + parts.len().saturating_sub(1)
-                        <= max_width
+                .map(|(_, text, _)| {
+                    UnicodeWidthStr::width(SEPARATOR) + UnicodeWidthStr::width(text.as_str())
                 })
-                .map_or_else(|| (Vec::new(), " "), |parts| (parts, " "));
-        }
-        chosen
-            .0
+                .sum::<usize>()
+    };
+    while width_of(&segments) > max_width && !segments.is_empty() {
+        let lowest = segments
             .iter()
-            .map(|part| paint(&part.text, part.tone, styled))
-            .collect::<Vec<_>>()
-            .join(chosen.1)
+            .enumerate()
+            .max_by_key(|(_, (priority, _, _))| *priority)
+            .map(|(index, _)| index)
+            .expect("segments is not empty");
+        segments.remove(lowest);
     }
+
+    if lead_width > max_width {
+        let plain: String = lead.iter().map(|(text, _)| text.as_str()).collect();
+        return paint(&ui::truncate(&plain, max_width), Tone::Muted, styled);
+    }
+    let mut output: String = lead
+        .iter()
+        .map(|(text, tone)| paint(text, *tone, styled))
+        .collect();
+    for (_, text, tone) in &segments {
+        output.push_str(&paint(SEPARATOR, Tone::Muted, styled));
+        output.push_str(&paint(text, *tone, styled));
+    }
+    output
 }
 
 #[derive(Default)]
@@ -919,15 +1059,6 @@ impl LiveRegion {
         self.line_count = 0;
     }
 
-    fn commit(&mut self) {
-        if self.line_count == 0 {
-            return;
-        }
-        print!("\r\n");
-        let _ = io::stdout().flush();
-        self.line_count = 0;
-    }
-
     fn push_clear_sequence(&self, output: &mut String) {
         if self.line_count == 0 {
             return;
@@ -942,60 +1073,114 @@ impl LiveRegion {
 
 struct CliDisplay {
     no_markdown: bool,
-    streamed_any: bool,
     interactive: bool,
     styled: bool,
     response_buffer: ResponseBuffer,
     thinking_line_buf: String,
     thinking_first_line: bool,
+    /// Blank thinking lines held back until more thinking text follows.
+    thinking_blank_lines: usize,
     live: LiveRegion,
     last_tokens: Option<TokenStatus>,
     last_live_refresh: Option<Instant>,
     finished: bool,
+    started: Instant,
+    phase: Phase,
+    pending_tool: Option<(String, Value)>,
+    /// Number of output blocks printed so far; used to separate blocks with a blank line.
+    blocks: usize,
+    /// Set while Esc can interrupt the turn.
+    cancel: Option<CancelToken>,
 }
 
 impl CliDisplay {
     fn new(no_markdown: bool) -> Self {
-        let interactive = io::stdout().is_terminal();
         Self {
             no_markdown,
-            streamed_any: false,
-            interactive,
-            styled: interactive && std::env::var_os("NO_COLOR").is_none(),
+            interactive: io::stdout().is_terminal(),
+            styled: ui::styled(),
             response_buffer: ResponseBuffer::new(),
             thinking_line_buf: String::new(),
             thinking_first_line: true,
+            thinking_blank_lines: 0,
             live: LiveRegion::default(),
             last_tokens: None,
             last_live_refresh: None,
             finished: false,
+            started: Instant::now(),
+            phase: Phase::Waiting,
+            pending_tool: None,
+            blocks: 0,
+            cancel: None,
         }
     }
 
-    fn live_lines(&self, active: bool, width: usize, height: usize) -> Vec<String> {
+    fn begin_block(&mut self) {
+        if self.blocks > 0 {
+            println!();
+        }
+        self.blocks += 1;
+    }
+
+    fn status_line(&self, outcome: Outcome, width: usize) -> String {
+        let elapsed = self.started.elapsed();
+        let cancelling = self.cancel.as_ref().is_some_and(CancelToken::is_cancelled);
+        let label = if cancelling {
+            "Interrupting".to_owned()
+        } else {
+            self.phase.label()
+        };
+        let info = StatusInfo {
+            outcome,
+            frame: (elapsed.as_millis() / SPINNER_INTERVAL.as_millis()) as usize,
+            label: &label,
+            elapsed_secs: elapsed.as_secs_f64(),
+            interruptible: self.cancel.is_some() && !cancelling,
+            tokens: self.last_tokens.as_ref(),
+        };
+        render_status(&info, width, self.styled)
+    }
+
+    fn live_lines(&self, width: usize, height: usize) -> Vec<String> {
         let width = width.saturating_sub(1).max(1);
         let mut lines = Vec::new();
+        let gap = |lines: &mut Vec<String>, blocks: usize| {
+            if blocks > 0 || !lines.is_empty() {
+                lines.push(String::new());
+            }
+        };
 
-        if !self.thinking_line_buf.is_empty() {
-            let prefix = if self.thinking_first_line {
-                "  🧠 "
-            } else {
-                "     "
-            };
-            let thinking_lines = prefixed_lines(&self.thinking_line_buf, prefix, "     ", width)
-                .into_iter()
-                .map(|line| paint(&line, Tone::Dim, self.styled));
-            lines.extend(thinking_lines);
+        if !self.thinking_line_buf.trim().is_empty() {
+            if self.thinking_first_line {
+                gap(&mut lines, self.blocks);
+            }
+            lines.extend(self.thinking_lines(&self.thinking_line_buf, width));
         }
 
         let response = self.response_buffer.text();
-        if !response.is_empty() {
-            lines.extend(prefixed_lines(&response, "🤖 ", "", width));
+        if !response.trim().is_empty() {
+            gap(&mut lines, self.blocks);
+            lines.extend(prefixed_lines(
+                response.trim_start(),
+                &format!("{BULLET} "),
+                "  ",
+                width,
+            ));
         }
 
-        if let Some(status) = self.last_tokens.as_ref() {
-            lines.push(status.render(width, self.styled, active));
+        if let Some((name, arguments)) = self.pending_tool.as_ref() {
+            gap(&mut lines, self.blocks);
+            lines.push(tool_header_line(
+                name,
+                arguments,
+                Tone::Muted,
+                width,
+                self.styled,
+            ));
         }
+
+        gap(&mut lines, self.blocks);
+        lines.push(self.status_line(Outcome::Active, width));
 
         let max_lines = height.saturating_sub(1).max(1);
         if lines.len() > max_lines {
@@ -1004,8 +1189,8 @@ impl CliDisplay {
         lines
     }
 
-    fn refresh_live(&mut self, active: bool, force: bool) {
-        if !self.interactive {
+    fn refresh_live(&mut self, force: bool) {
+        if !self.interactive || self.finished {
             return;
         }
         if !force
@@ -1016,9 +1201,14 @@ impl CliDisplay {
             return;
         }
         let (width, height) = terminal_dimensions();
-        let lines = self.live_lines(active, width, height);
+        let lines = self.live_lines(width, height);
         self.live.replace(&lines);
         self.last_live_refresh = Some(Instant::now());
+    }
+
+    /// Advance the spinner animation.
+    fn tick(&mut self) {
+        self.refresh_live(false);
     }
 
     fn prepare_output(&mut self) {
@@ -1028,40 +1218,113 @@ impl CliDisplay {
         }
     }
 
-    fn discard_preview(&mut self) {
+    /// Print an error for the whole turn, dropping any half-streamed output.
+    fn fail(&mut self, message: &str) {
         self.prepare_output();
         self.response_buffer.reset();
         self.thinking_line_buf.clear();
-        self.thinking_first_line = true;
+        self.pending_tool = None;
+        self.begin_block();
+        let width = terminal_width().saturating_sub(1).max(4);
+        for (index, line) in prefixed_lines(message, "", "", width.saturating_sub(2))
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if index == 0 {
+                format!("{} ", paint(CROSS, Tone::Error, self.styled))
+            } else {
+                "  ".to_owned()
+            };
+            println!("{prefix}{}", paint(&line, Tone::Error, self.styled));
+        }
+        self.finish(Outcome::Failed);
     }
 
-    fn finish(&mut self) {
+    /// End a turn the user interrupted, dropping any half-streamed response.
+    fn interrupt(&mut self) {
+        self.prepare_output();
+        self.response_buffer.reset();
+        self.pending_tool = None;
+        self.finish(Outcome::Interrupted);
+    }
+
+    /// Finish a successful turn (no-op if the turn already failed).
+    fn complete(&mut self) {
+        self.finish(Outcome::Done);
+    }
+
+    fn finish(&mut self, outcome: Outcome) {
         if self.finished {
             return;
         }
-        self.finished = true;
-        if self.interactive {
-            self.refresh_live(false, true);
-            self.live.commit();
-        } else if let Some(status) = self.last_tokens.as_ref() {
-            println!("{}", status.render(usize::MAX, false, false));
+        self.prepare_output();
+        if !self.thinking_line_buf.is_empty() {
+            self.finish_thinking();
         }
+        self.finished = true;
+        if self.blocks > 0 {
+            println!();
+        }
+        let width = terminal_width().saturating_sub(1).max(1);
+        println!("{}", self.status_line(outcome, width));
     }
 
-    fn print_final_response(&mut self, content: &str, active: bool) {
+    fn print_final_response(&mut self, content: &str) {
         self.prepare_output();
         self.response_buffer.reset();
+        self.phase = Phase::Waiting;
+        let content = content.trim();
         if !content.is_empty() {
-            if self.no_markdown {
-                println!("🤖 {content}");
+            self.begin_block();
+            let width = terminal_width().saturating_sub(1).max(4);
+            let bullet = format!("{BULLET} ");
+            let lines = if self.no_markdown {
+                prefixed_lines(content, &bullet, "  ", width)
             } else {
-                print!("🤖 ");
-                let _ = io::stdout().flush();
-                render_markdown(content);
-                println!();
+                markdown_lines(content, width - 2, self.styled)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        format!("{}{line}", if index == 0 { bullet.as_str() } else { "  " })
+                    })
+                    .collect()
+            };
+            for line in lines {
+                println!("{}", line.trim_end_matches(' '));
             }
         }
-        self.refresh_live(active, true);
+        self.refresh_live(true);
+    }
+
+    fn thinking_lines(&self, text: &str, width: usize) -> Vec<String> {
+        let first_prefix = if self.thinking_first_line {
+            format!("{THINKING} ")
+        } else {
+            "  ".to_owned()
+        };
+        prefixed_lines(&sanitize(text), &first_prefix, "  ", width)
+            .into_iter()
+            .map(|line| paint(&line, Tone::Thinking, self.styled))
+            .collect()
+    }
+
+    fn print_thinking_line(&mut self, line: &str) {
+        if line.trim().is_empty() {
+            if !self.thinking_first_line {
+                self.thinking_blank_lines += 1;
+            }
+            return;
+        }
+        if self.thinking_first_line {
+            self.begin_block();
+        } else if std::mem::take(&mut self.thinking_blank_lines) > 0 {
+            println!();
+        }
+        let width = terminal_width().saturating_sub(1).max(4);
+        for line in self.thinking_lines(line, width) {
+            println!("{line}");
+        }
+        self.thinking_first_line = false;
     }
 
     fn flush_thinking_lines(&mut self) {
@@ -1072,59 +1335,67 @@ impl CliDisplay {
         let completed = self.thinking_line_buf[..=newline].to_owned();
         self.prepare_output();
         for line in completed.split_terminator('\n') {
-            let prefix = if self.thinking_first_line {
-                "  🧠 "
-            } else {
-                "     "
-            };
-            print_wrapped(
-                line,
-                prefix,
-                "     ",
-                Tone::Dim,
-                self.styled,
-                terminal_width(),
-            );
-            self.thinking_first_line = false;
+            self.print_thinking_line(line);
         }
         self.thinking_line_buf = remainder;
     }
 
     fn finish_thinking(&mut self) {
         self.prepare_output();
-        if !self.thinking_line_buf.is_empty() {
-            let prefix = if self.thinking_first_line {
-                "  🧠 "
-            } else {
-                "     "
-            };
-            print_wrapped(
-                &self.thinking_line_buf,
-                prefix,
-                "     ",
-                Tone::Dim,
-                self.styled,
-                terminal_width(),
-            );
+        let remainder = std::mem::take(&mut self.thinking_line_buf);
+        if !remainder.is_empty() {
+            self.print_thinking_line(&remainder);
         }
-        self.thinking_line_buf.clear();
         self.thinking_first_line = true;
+        self.thinking_blank_lines = 0;
+    }
+
+    fn print_notice(&mut self, message: &str) {
+        self.prepare_output();
+        self.begin_block();
+        println!(
+            "{} {}",
+            paint(WARN, Tone::Warning, self.styled),
+            paint(message, Tone::Warning, self.styled)
+        );
+        self.refresh_live(true);
+    }
+
+    fn print_tool_block(&mut self, name: &str, arguments: &Value, result: &str) {
+        self.prepare_output();
+        self.begin_block();
+        let width = terminal_width().saturating_sub(1).max(12);
+        let bullet = if tool_failed(name, result) {
+            Tone::Error
+        } else {
+            Tone::Success
+        };
+        println!(
+            "{}",
+            tool_header_line(name, arguments, bullet, width, self.styled)
+        );
+        let body = tool_body(name, arguments, result, width - 5, self.styled);
+        for (index, line) in body.iter().enumerate() {
+            if index == 0 {
+                println!("  {}  {line}", paint(RESULT, Tone::Muted, self.styled));
+            } else {
+                println!("     {line}");
+            }
+        }
     }
 
     fn on_event(&mut self, event: &Event) {
         match event {
             Event::TurnStart => {
                 self.response_buffer.reset();
-                self.streamed_any = false;
-                self.refresh_live(true, true);
+                self.phase = Phase::Waiting;
+                self.refresh_live(true);
             }
             Event::Tokens {
                 input_tokens,
                 output_tokens,
-                total_tokens,
                 cached_tokens,
                 turn_input,
-                turn_output,
                 context_window,
                 model,
                 reasoning_effort,
@@ -1133,183 +1404,345 @@ impl CliDisplay {
                 self.last_tokens = Some(TokenStatus {
                     input_tokens: *input_tokens,
                     output_tokens: *output_tokens,
-                    total_tokens: *total_tokens,
                     cached_tokens: *cached_tokens,
                     turn_input: *turn_input,
-                    turn_output: *turn_output,
                     context_window: *context_window,
                     model: model.clone(),
                     reasoning_effort: reasoning_effort.clone(),
                 });
-                if self.interactive {
-                    self.refresh_live(true, true);
-                }
+                self.refresh_live(true);
             }
             Event::Thinking { content } => {
                 self.prepare_output();
-                print_wrapped(
-                    content,
-                    "  🧠 ",
-                    "     ",
-                    Tone::Dim,
-                    self.styled,
-                    terminal_width(),
-                );
-                self.refresh_live(true, true);
+                for line in content.lines() {
+                    self.print_thinking_line(line);
+                }
+                self.thinking_first_line = true;
+                self.thinking_blank_lines = 0;
+                self.refresh_live(true);
             }
             Event::ThinkingDelta { content } => {
                 if !content.is_empty() {
+                    self.phase = Phase::Thinking;
                     self.thinking_line_buf.push_str(content);
                     self.flush_thinking_lines();
-                    self.refresh_live(true, false);
+                    self.refresh_live(false);
                 }
             }
             Event::ThinkingEnd => {
                 self.finish_thinking();
-                self.refresh_live(true, true);
+                self.phase = Phase::Waiting;
+                self.refresh_live(true);
             }
             Event::TextDelta { content } => {
                 if !content.is_empty() {
+                    self.phase = Phase::Writing;
                     self.response_buffer.append(content);
-                    self.streamed_any = true;
-                    self.refresh_live(true, false);
+                    self.refresh_live(false);
                 }
             }
-            Event::TextEnd { content } => {
-                self.print_final_response(content, true);
+            Event::TextEnd { content } | Event::Text { content } => {
+                self.print_final_response(content);
             }
-            Event::Text { content } => self.print_final_response(content, true),
             Event::ToolCall { name, arguments } => {
-                self.prepare_output();
-                self.print_tool_call(name, arguments);
-                self.refresh_live(true, true);
+                self.phase = Phase::Tool(name.clone());
+                self.pending_tool = Some((name.clone(), arguments.clone()));
+                self.refresh_live(true);
             }
             Event::ToolResult { name, result } => {
-                self.prepare_output();
-                println!("     ├─ result:");
-                print_truncated(
-                    result,
-                    "     │ ",
-                    if matches!(name.as_str(), "write" | "edit") {
-                        Tone::Green
-                    } else {
-                        Tone::Plain
-                    },
-                    self.styled,
-                    terminal_width(),
-                    "full output received by agent",
-                );
-                self.refresh_live(true, true);
+                let arguments = self
+                    .pending_tool
+                    .take()
+                    .filter(|(pending, _)| pending == name)
+                    .map_or(Value::Null, |(_, arguments)| arguments);
+                self.print_tool_block(name, &arguments, result);
+                self.phase = Phase::Waiting;
+                self.refresh_live(true);
             }
             Event::FinishReason { reason, .. } => {
-                self.prepare_output();
                 let warning = match reason.as_str() {
-                    "length" => "Warning: The response was truncated because it reached the model's output limit.".to_owned(),
-                    "content_filter" => "Warning: The response was stopped by the provider's content filter.".to_owned(),
-                    _ => format!("Warning: The response stopped with finish reason {reason:?}."),
+                    "length" => {
+                        "The response was truncated at the model's output limit.".to_owned()
+                    }
+                    "content_filter" => {
+                        "The response was stopped by the provider's content filter.".to_owned()
+                    }
+                    _ => format!("The response stopped with finish reason {reason:?}."),
                 };
-                println!("{}", paint(&warning, Tone::Yellow, self.styled));
-                self.refresh_live(true, true);
+                self.print_notice(&warning);
             }
             Event::HistoryTrimmed { summarized } => {
-                self.prepare_output();
-                let message =
-                    format!("Context window reached: summarized {summarized} earlier message(s).");
-                println!("{}", paint(&message, Tone::Yellow, self.styled));
-                self.refresh_live(true, true);
+                self.print_notice(&format!(
+                    "Context window nearly full: summarized {summarized} earlier {}.",
+                    plural(*summarized, "message")
+                ));
             }
         }
     }
+}
 
-    fn print_tool_call(&self, name: &str, arguments: &Value) {
-        if name == "bash" {
-            let command = arguments
-                .get("command")
+fn tool_failed(name: &str, result: &str) -> bool {
+    result.starts_with("Error") || (name == "bash" && split_exit_code(result).1.is_some())
+}
+
+/// Title and short argument summary for a tool call, e.g. `("Bash", "cargo test")`.
+fn tool_header(name: &str, arguments: &Value) -> (String, String) {
+    let text = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("");
+    match name {
+        "bash" => {
+            let command = text("command").trim();
+            let mut lines = command.lines();
+            let first = lines.next().unwrap_or("").to_owned();
+            let detail = if lines.next().is_some() {
+                format!("{first} …")
+            } else {
+                first
+            };
+            ("Bash".to_owned(), detail)
+        }
+        "read" => {
+            let offset = arguments.get("offset").and_then(Value::as_u64);
+            let limit = arguments.get("limit").and_then(Value::as_u64);
+            let range = match (offset, limit) {
+                (None, None) => String::new(),
+                (offset, Some(limit)) => {
+                    let start = offset.unwrap_or(1);
+                    format!(":{start}-{}", start + limit.saturating_sub(1))
+                }
+                (Some(offset), None) => format!(":{offset}-"),
+            };
+            ("Read".to_owned(), format!("{}{range}", text("path")))
+        }
+        "write" => ("Write".to_owned(), text("path").to_owned()),
+        "edit" => ("Edit".to_owned(), text("path").to_owned()),
+        other => (other.to_owned(), format_arguments(arguments)),
+    }
+}
+
+fn tool_header_line(
+    name: &str,
+    arguments: &Value,
+    bullet: Tone,
+    width: usize,
+    styled: bool,
+) -> String {
+    let (title, detail) = tool_header(name, arguments);
+    let title_width = UnicodeWidthStr::width(title.as_str());
+    let room = width.saturating_sub(2 + title_width + 2);
+    let detail = ui::truncate(&sanitize(&detail), room);
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!("({detail})")
+    };
+    format!(
+        "{} {}{detail}",
+        paint(BULLET, bullet, styled),
+        paint(
+            &ui::truncate(&title, width.saturating_sub(2)),
+            Tone::Bold,
+            styled
+        )
+    )
+}
+
+/// Summarize a tool result for display. Lines are at most `width` columns wide.
+fn tool_body(
+    name: &str,
+    arguments: &Value,
+    result: &str,
+    width: usize,
+    styled: bool,
+) -> Vec<String> {
+    let width = width.max(4);
+    if result.starts_with("Error") {
+        let lines: Vec<String> = result
+            .lines()
+            .flat_map(|line| wrap_line(&sanitize(line), width))
+            .collect();
+        return capped(lines, Tone::Error, styled);
+    }
+    match name {
+        "read" => {
+            let count = result.lines().count();
+            vec![format!(
+                "Read {} {}",
+                paint(&count.to_string(), Tone::Bold, styled),
+                plural(count, "line")
+            )]
+        }
+        "write" => {
+            let content = arguments
+                .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            println!();
-            print_wrapped(
-                command,
-                "  🔧 ",
-                "     ",
-                Tone::Blue,
-                self.styled,
-                terminal_width(),
-            );
-        } else if name == "write" {
-            let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
-            println!(
-                "\n  🔧 {}",
-                paint(&format!("write(path={path:?})"), Tone::Green, self.styled)
-            );
-            print_truncated(
-                arguments
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-                "     │ ",
-                Tone::Green,
-                self.styled,
-                terminal_width(),
-                "full content sent to agent",
-            );
-        } else if name == "edit" {
-            let path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
-            let edits = arguments.get("edits").and_then(Value::as_array);
-            println!(
-                "\n  🔧 {}",
-                paint(
-                    &format!(
-                        "edit(path={path:?}) — {} edit(s)",
-                        edits.map_or(0, |edits| edits.len())
+            let total = content.lines().count();
+            let mut lines = vec![format!(
+                "Wrote {} {}",
+                paint(&total.to_string(), Tone::Bold, styled),
+                plural(total, "line")
+            )];
+            let number_width = total.min(DISPLAY_TRUNCATION_LIMIT).to_string().len();
+            for (index, line) in content.lines().take(DISPLAY_TRUNCATION_LIMIT).enumerate() {
+                lines.push(format!(
+                    "{} {}",
+                    paint(
+                        &format!("{:>number_width$}", index + 1),
+                        Tone::Muted,
+                        styled
                     ),
-                    Tone::Green,
-                    self.styled,
-                )
-            );
-            for (index, edit) in edits.into_iter().flatten().enumerate() {
-                println!("     ├─ Edit {}:", index + 1);
-                if let Some(old_text) = edit.get("oldText").and_then(Value::as_str) {
-                    println!(
-                        "     │ {}",
-                        paint(
-                            &format!("oldText ({} lines):", old_text.lines().count()),
-                            Tone::Green,
-                            self.styled,
-                        )
-                    );
-                    print_truncated(
-                        old_text,
-                        "     │ ",
-                        Tone::Green,
-                        self.styled,
-                        terminal_width(),
-                        "full content sent to agent",
-                    );
-                }
-                if let Some(new_text) = edit.get("newText").and_then(Value::as_str) {
-                    println!(
-                        "     │ {}",
-                        paint(
-                            &format!("newText ({} lines):", new_text.lines().count()),
-                            Tone::Green,
-                            self.styled,
-                        )
-                    );
-                    print_truncated(
-                        new_text,
-                        "     │ ",
-                        Tone::Green,
-                        self.styled,
-                        terminal_width(),
-                        "full content sent to agent",
-                    );
-                }
+                    ui::truncate(&sanitize(line), width.saturating_sub(number_width + 1))
+                ));
             }
-        } else {
-            println!("\n  🔧 {name}({})", format_arguments(arguments));
+            if total > DISPLAY_TRUNCATION_LIMIT {
+                lines.push(more_lines(total - DISPLAY_TRUNCATION_LIMIT, styled));
+            }
+            lines
+        }
+        "edit" => edit_body(arguments, width, styled),
+        "bash" => {
+            let (output, exit_code) = split_exit_code(result);
+            let output = output.trim_end();
+            let mut lines = if output.trim().is_empty() || output == "(no output)" {
+                vec![paint("(no output)", Tone::Muted, styled)]
+            } else {
+                preview_lines(output, width, Tone::Muted, styled)
+            };
+            if let Some(code) = exit_code {
+                lines.push(paint(&format!("exit code {code}"), Tone::Error, styled));
+            }
+            lines
+        }
+        _ => preview_lines(result, width, Tone::Muted, styled),
+    }
+}
+
+fn edit_body(arguments: &Value, width: usize, styled: bool) -> Vec<String> {
+    let edits = arguments
+        .get("edits")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "Applied {} {}",
+        paint(&edits.len().to_string(), Tone::Bold, styled),
+        plural(edits.len(), "edit")
+    )];
+    for (index, edit) in edits.iter().take(MAX_EDITS_SHOWN).enumerate() {
+        if index > 0 {
+            lines.push(paint("⋮", Tone::Muted, styled));
+        }
+        let text = |key: &str| edit.get(key).and_then(Value::as_str).unwrap_or("");
+        let (removed, added) = changed_lines(text("oldText"), text("newText"));
+        for (diff_lines, sign, tone) in [(removed, '-', Tone::Removed), (added, '+', Tone::Added)] {
+            for line in diff_lines.iter().take(MAX_DIFF_LINES) {
+                let line = ui::truncate(&sanitize(line), width.saturating_sub(2));
+                lines.push(paint(&format!("{sign} {line}"), tone, styled));
+            }
+            if diff_lines.len() > MAX_DIFF_LINES {
+                lines.push(more_lines(diff_lines.len() - MAX_DIFF_LINES, styled));
+            }
         }
     }
+    if edits.len() > MAX_EDITS_SHOWN {
+        let hidden = edits.len() - MAX_EDITS_SHOWN;
+        lines.push(paint(
+            &format!("… +{hidden} more {}", plural(hidden, "edit")),
+            Tone::Muted,
+            styled,
+        ));
+    }
+    lines
+}
+
+/// Lines that differ between `old` and `new`, ignoring their shared leading and trailing lines.
+fn changed_lines<'a>(old: &'a str, new: &'a str) -> (Vec<&'a str>, Vec<&'a str>) {
+    let old: Vec<&str> = old.lines().collect();
+    let new: Vec<&str> = new.lines().collect();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let max_suffix = old.len().min(new.len()) - prefix;
+    let suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let removed = old[prefix..old.len() - suffix].to_vec();
+    let added = new[prefix..new.len() - suffix].to_vec();
+    if removed.is_empty() && added.is_empty() {
+        (old, new)
+    } else {
+        (removed, added)
+    }
+}
+
+/// Split a trailing `[Exit code: N]` marker from bash output.
+fn split_exit_code(result: &str) -> (&str, Option<i64>) {
+    let trimmed = result.trim_end();
+    if let Some(start) = trimmed.rfind("[Exit code: ")
+        && let Some(code) = trimmed[start + 12..]
+            .strip_suffix(']')
+            .and_then(|code| code.trim().parse().ok())
+    {
+        return (&trimmed[..start], Some(code));
+    }
+    (result, None)
+}
+
+fn preview_lines(text: &str, width: usize, tone: Tone, styled: bool) -> Vec<String> {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| ui::truncate(&sanitize(line), width))
+        .collect();
+    capped(lines, tone, styled)
+}
+
+fn capped(lines: Vec<String>, tone: Tone, styled: bool) -> Vec<String> {
+    let total = lines.len();
+    let mut output: Vec<String> = lines
+        .into_iter()
+        .take(DISPLAY_TRUNCATION_LIMIT)
+        .map(|line| paint(&line, tone, styled))
+        .collect();
+    if total > DISPLAY_TRUNCATION_LIMIT {
+        output.push(more_lines(total - DISPLAY_TRUNCATION_LIMIT, styled));
+    }
+    output
+}
+
+fn more_lines(count: usize, styled: bool) -> String {
+    paint(
+        &format!("… +{count} {}", plural(count, "line")),
+        Tone::Muted,
+        styled,
+    )
+}
+
+/// Make tool output safe to measure and print: expand tabs, drop ANSI escapes and
+/// other control characters.
+fn sanitize(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\t' => output.push_str("    "),
+            '\n' => output.push('\n'),
+            '\x1b' => {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+            }
+            character if character.is_control() => {}
+            character => output.push(character),
+        }
+    }
+    output
 }
 
 fn terminal_dimensions() -> (usize, usize) {
@@ -1406,64 +1839,18 @@ fn prefixed_lines(text: &str, first_prefix: &str, rest_prefix: &str, width: usiz
     output
 }
 
-fn print_wrapped(
-    text: &str,
-    first_prefix: &str,
-    rest_prefix: &str,
-    tone: Tone,
-    styled: bool,
-    width: usize,
-) {
-    let mut first = true;
-    for line in text.lines() {
-        let prefix = if first { first_prefix } else { rest_prefix };
-        let available = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
-        for (index, chunk) in wrap_line(line, available).iter().enumerate() {
-            let prefix = if index == 0 { prefix } else { rest_prefix };
-            println!("{prefix}{}", paint(chunk, tone, styled));
-        }
-        first = false;
-    }
-}
-
-fn print_truncated(
-    text: &str,
-    prefix: &str,
-    tone: Tone,
-    styled: bool,
-    width: usize,
-    full_output_note: &str,
-) {
-    let lines: Vec<_> = text.lines().collect();
-    let available = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
-    for line in lines.iter().take(DISPLAY_TRUNCATION_LIMIT) {
-        for chunk in wrap_line(line, available) {
-            println!("{prefix}{}", paint(&chunk, tone, styled));
-        }
-    }
-    if lines.len() > DISPLAY_TRUNCATION_LIMIT {
-        let notice = format!(
-            "… truncated: {} of {} lines hidden ({full_output_note})",
-            lines.len() - DISPLAY_TRUNCATION_LIMIT,
-            lines.len()
-        );
-        println!("     └─ {}", paint(&notice, tone, styled));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use serde_json::json;
 
     fn sample_token_status() -> TokenStatus {
         TokenStatus {
             input_tokens: 5_000,
             output_tokens: 200,
-            total_tokens: 5_200,
             cached_tokens: 1_000,
             turn_input: 5_000,
-            turn_output: 200,
             context_window: 1_000_000,
             model: "a-very-long-model-name".to_owned(),
             reasoning_effort: Some("high".to_owned()),
@@ -1485,10 +1872,18 @@ mod tests {
         }
     }
 
+    fn quiet_display() -> CliDisplay {
+        let mut display = CliDisplay::new(false);
+        display.interactive = false;
+        display.styled = false;
+        display
+    }
+
     #[test]
     fn cli_defaults_and_stream_flags_match_python() {
         let args = Cli::try_parse_from(["harness"]).unwrap();
-        assert_eq!(args.model, DEFAULT_MODEL);
+        assert!(args.model.is_none());
+        assert!(args.context_window.is_none());
         assert!(!args.no_stream);
 
         let args = Cli::try_parse_from(["harness", "--no-stream"]).unwrap();
@@ -1499,75 +1894,213 @@ mod tests {
     }
 
     #[test]
+    fn model_metadata_rejects_invalid_windows_and_accepts_provider_formats() {
+        for value in [
+            json!(null),
+            json!(0),
+            json!(-1),
+            json!("unknown"),
+            json!(1.5),
+        ] {
+            assert_eq!(
+                model_context_window(&json!({"context_window": value})),
+                None
+            );
+        }
+        assert_eq!(
+            model_context_window(&json!({"context_length": "32768"})),
+            Some(32768)
+        );
+        assert_eq!(
+            model_context_window(&json!({"architecture": {"context_length": 65536}})),
+            Some(65536)
+        );
+        assert_eq!(
+            model_context_window(
+                &json!({"context_window": 0, "top_provider": {"context_length": 128000}})
+            ),
+            Some(128000)
+        );
+    }
+
+    #[test]
+    fn switching_models_updates_context_and_preserves_explicit_overrides() {
+        let fetcher = ModelFetcher {
+            base_url: String::new(),
+            api_key: None,
+            requires_routing: false,
+            state: Arc::new((
+                Mutex::new(Some(ModelCatalog {
+                    context_windows: BTreeMap::from([("small".to_owned(), 32768)]),
+                    sources: BTreeMap::from([("small".to_owned(), vec![0])]),
+                    ..ModelCatalog::default()
+                })),
+                Condvar::new(),
+            )),
+        };
+        let mut agent = AgentHarness::new(AgentConfig::new("small")).unwrap();
+        apply_model_metadata(&mut agent, &fetcher, None);
+        assert_eq!(agent.context_window, 32768);
+        apply_model_metadata(&mut agent, &fetcher, Some(8192));
+        assert_eq!(agent.context_window, 8192);
+        agent.select_model("missing", None);
+        apply_model_metadata(&mut agent, &fetcher, None);
+        assert_eq!(agent.context_window, DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn model_catalog_fetches_metadata_and_uses_the_smallest_provider_window() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for window in [128000, 64000] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(
+                    String::from_utf8(request)
+                        .unwrap()
+                        .starts_with("GET /models ")
+                );
+                let body = json!({"data": [{"id": "shared", "context_length": window}, {"id": "unknown"}]}).to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let catalog = fetch_models(&format!("{base_url};;{base_url}"), Some("key")).unwrap();
+        server.join().unwrap();
+        assert_eq!(catalog.models, ["shared", "unknown"]);
+        assert_eq!(catalog.sources["shared"], [0, 1]);
+        assert_eq!(catalog.context_windows["shared"], 64000);
+        assert!(!catalog.context_windows.contains_key("unknown"));
+        assert!(catalog.failures.is_empty());
+    }
+
+    #[test]
     fn positive_values_are_validated() {
         assert!(Cli::try_parse_from(["harness", "--max-turns", "0"]).is_err());
         assert!(Cli::try_parse_from(["harness", "--context-window", "-1"]).is_err());
     }
 
+    fn status(
+        outcome: Outcome,
+        label: &str,
+        interruptible: bool,
+        tokens: Option<&TokenStatus>,
+        width: usize,
+    ) -> String {
+        let info = StatusInfo {
+            outcome,
+            frame: 2,
+            label,
+            elapsed_secs: 12.34,
+            interruptible,
+            tokens,
+        };
+        render_status(&info, width, false)
+    }
+
     #[test]
-    fn welcome_box_rows_have_equal_display_width() {
-        let box_text = build_welcome_box(
-            "model",
-            "high",
-            1_000_000,
-            std::path::Path::new("project"),
-            true,
+    fn status_line_shows_all_details_when_space_allows() {
+        let tokens = sample_token_status();
+        let full = status(Outcome::Done, "Working", true, Some(&tokens), 200);
+        assert!(full.starts_with("✓ Done in 12.3s"));
+        assert!(full.contains("↑ 5k ↓ 200"));
+        assert!(full.contains("ctx 0.5%"));
+        assert!(full.contains("cache 20%"));
+        assert!(full.contains("a-very-long-model-name"));
+        assert!(full.contains("high"));
+        assert!(
+            !full.contains("esc"),
+            "finished turns cannot be interrupted"
         );
-        let widths: Vec<_> = box_text.lines().map(UnicodeWidthStr::width).collect();
-        assert!(widths.windows(2).all(|pair| pair[0] == pair[1]));
-        assert!(box_text.contains("1,000,000 tokens"));
-        assert!(box_text.contains("🤖 Nasa Level Genius Agent"));
-        assert!(box_text.starts_with('╔'));
-        assert!(box_text.ends_with('╝'));
+
+        assert_eq!(
+            status(Outcome::Active, "Thinking", false, None, 200),
+            "⠹ Thinking… 12s"
+        );
+        assert_eq!(
+            status(Outcome::Active, "Thinking", true, None, 200),
+            "⠹ Thinking… 12s · esc to interrupt"
+        );
+        assert!(
+            status(Outcome::Interrupted, "", false, None, 200).starts_with("■ Interrupted after")
+        );
     }
 
     #[test]
-    fn status_bar_compacts_to_terminal_width() {
-        let status = sample_token_status();
-
-        let compact = status.render(48, false, false);
-        assert!(UnicodeWidthStr::width(compact.as_str()) <= 48);
+    fn status_line_drops_low_priority_details_first() {
+        let tokens = sample_token_status();
+        let compact = status(Outcome::Done, "", false, Some(&tokens), 40);
+        assert!(UnicodeWidthStr::width(compact.as_str()) <= 40);
+        assert!(compact.contains("↑ 5k"));
+        assert!(!compact.contains("cache"));
         assert!(!compact.contains("a-very-long-model-name"));
-        assert!(!compact.contains("Cache:"));
 
-        let full = status.render(200, false, false);
-        assert!(full.contains("Ctx:0.5%"));
-        assert!(full.contains("Cache:1,000 (20.0%)"));
-        assert!(full.contains("🧠 high"));
+        let active = status(Outcome::Active, "Working", true, Some(&tokens), 60);
+        assert!(active.contains("esc to interrupt"));
+        assert!(!active.contains("a-very-long-model-name"));
     }
 
     #[test]
-    fn status_bar_never_wraps_on_narrow_terminals() {
-        let status = sample_token_status();
-
-        for width in 1..=64 {
-            let rendered = status.render(width, false, false);
-            assert!(
-                UnicodeWidthStr::width(rendered.as_str()) <= width,
-                "status exceeded terminal width {width}: {rendered:?}"
-            );
+    fn status_line_never_wraps_on_narrow_terminals() {
+        let tokens = sample_token_status();
+        let outcomes = [
+            Outcome::Active,
+            Outcome::Done,
+            Outcome::Failed,
+            Outcome::Interrupted,
+        ];
+        for outcome in outcomes {
+            for width in 1..=100 {
+                let rendered = status(outcome, "Running command", true, Some(&tokens), width);
+                assert!(
+                    UnicodeWidthStr::width(rendered.as_str()) <= width,
+                    "status exceeded terminal width {width}: {rendered:?}"
+                );
+            }
         }
     }
 
     #[test]
     fn live_frame_keeps_response_and_status_together() {
-        let mut display = CliDisplay::new(false);
-        display.interactive = false;
-        display.styled = false;
+        let mut display = quiet_display();
         display.on_event(&Event::TextDelta {
             content: "## Summary\n\n**formatted** response".to_owned(),
         });
         display.on_event(&sample_token_event());
 
-        let lines = display.live_lines(true, 80, 24);
-        assert!(lines.iter().any(|line| line.contains("## Summary")));
-        assert!(lines.last().is_some_and(|line| line.contains("Tot:5,200")));
+        let lines = display.live_lines(80, 24);
+        assert!(lines.iter().any(|line| line.contains("● ## Summary")));
+        let status = lines.last().unwrap();
+        assert!(status.contains("Writing…"));
+        assert!(status.contains("↑ 5k ↓ 200"));
+    }
+
+    #[test]
+    fn live_frame_shows_pending_tool_call() {
+        let mut display = quiet_display();
+        display.on_event(&Event::ToolCall {
+            name: "bash".to_owned(),
+            arguments: json!({"command": "cargo test"}),
+        });
+        let lines = display.live_lines(80, 24);
+        assert!(lines.iter().any(|line| line == "● Bash(cargo test)"));
+        assert!(lines.last().unwrap().contains("Running command…"));
     }
 
     #[test]
     fn turn_start_preserves_previous_token_status() {
-        let mut display = CliDisplay::new(false);
-        display.interactive = false;
+        let mut display = quiet_display();
         display.on_event(&sample_token_event());
         display.on_event(&Event::TurnStart);
 
@@ -1575,9 +2108,99 @@ mod tests {
             display
                 .last_tokens
                 .as_ref()
-                .map(|status| status.total_tokens),
-            Some(5_200)
+                .map(|status| status.input_tokens),
+            Some(5_000)
         );
+    }
+
+    #[test]
+    fn tool_headers_summarize_arguments() {
+        assert_eq!(
+            tool_header("bash", &json!({"command": "ls\npwd"})),
+            ("Bash".to_owned(), "ls …".to_owned())
+        );
+        assert_eq!(
+            tool_header("read", &json!({"path": "a.rs", "offset": 10, "limit": 5})),
+            ("Read".to_owned(), "a.rs:10-14".to_owned())
+        );
+        let line = tool_header_line(
+            "bash",
+            &json!({"command": "x".repeat(200)}),
+            Tone::Success,
+            40,
+            false,
+        );
+        assert!(UnicodeWidthStr::width(line.as_str()) <= 40);
+        assert!(line.ends_with("…)"));
+    }
+
+    #[test]
+    fn bash_results_show_output_preview_and_exit_code() {
+        let output = (1..=8)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = format!("{output}\n[Exit code: 2]");
+        assert!(tool_failed("bash", &result));
+        let body = tool_body("bash", &Value::Null, &result, 40, false);
+        assert_eq!(body.first().map(String::as_str), Some("line 1"));
+        assert!(body.contains(&"… +3 lines".to_owned()));
+        assert_eq!(body.last().map(String::as_str), Some("exit code 2"));
+
+        assert!(!tool_failed("bash", "ok"));
+        assert_eq!(
+            tool_body("bash", &Value::Null, "(no output)", 40, false),
+            ["(no output)"]
+        );
+    }
+
+    #[test]
+    fn edit_results_show_a_compact_diff() {
+        let arguments = json!({"path": "a.rs", "edits": [{
+            "oldText": "fn a() {\n    old();\n}",
+            "newText": "fn a() {\n    new();\n    more();\n}"
+        }]});
+        let body = tool_body(
+            "edit",
+            &arguments,
+            "Successfully applied 1 edit(s) to a.rs.",
+            60,
+            false,
+        );
+        assert_eq!(
+            body,
+            [
+                "Applied 1 edit",
+                "-     old();",
+                "+     new();",
+                "+     more();"
+            ]
+        );
+    }
+
+    #[test]
+    fn read_and_error_results_are_summarized() {
+        assert_eq!(
+            tool_body("read", &Value::Null, "a\nb\nc", 40, false),
+            ["Read 3 lines"]
+        );
+        let body = tool_body("read", &Value::Null, "Error: File not found: x", 40, false);
+        assert!(tool_failed("read", "Error: File not found: x"));
+        assert_eq!(body, ["Error: File not found: x"]);
+    }
+
+    #[test]
+    fn sanitize_strips_escapes_and_expands_tabs() {
+        assert_eq!(sanitize("\x1b[31mred\x1b[0m\tok\r"), "red    ok");
+    }
+
+    #[test]
+    fn unknown_commands_are_detected_without_catching_paths() {
+        assert!(is_unknown_command("/foo"));
+        assert!(!is_unknown_command("/help"));
+        assert!(!is_unknown_command("/usr/bin is broken"));
+        assert!(!is_unknown_command("/usr/bin"));
+        assert!(!is_unknown_command("hello"));
     }
 
     #[test]

@@ -21,8 +21,19 @@ summarization, token events, markdown rendering, and the unrestricted
   rendered as formatted Markdown.
 - **Configurable reasoning effort** — pass
   `--reasoning-effort low|medium|high|xhigh|max` for models that support it.
-- **Live events** — tool calls, tool results, thinking blocks, and a live
-  token/context status bar are shown in real time.
+- **Polished terminal UI** — an animated status line shows what the agent is
+  doing, elapsed time, and token/context usage. Tool calls are rendered as
+  compact `● Bash(cargo test)` blocks with output previews, edits as
+  red/green diffs, and each turn ends with a one-line summary. Colors follow
+  `NO_COLOR` and are omitted when output is piped.
+- **Line editing** — input history (persisted across sessions), Tab
+  completion and inline hints for slash commands, and `\` + Enter for
+  multi-line messages.
+- **Quick reasoning switch** — press Tab at the prompt to cycle the reasoning
+  effort; the `▰▰▰▱▱` meter before the `›` shows the current level.
+- **Interruptible** — press Esc (or Ctrl+C) while the agent works to stop
+  it, including any running shell command. Completed tool steps stay in
+  the conversation.
 - **Conversation history** — context is remembered across turns; use `/clear`
   to reset.
 - **Automatic context management** — history is trimmed/summarized when it
@@ -100,14 +111,14 @@ The CLI options and environment variables mirror the Python implementation.
 
 | CLI option | Environment variable | Description |
 |------------|----------------------|-------------|
-| `-m`, `--model` | `HARNESS_MODEL` | Model name (default `deepseek-v4-pro`) |
+| `-m`, `--model` | `HARNESS_MODEL` | Model name (defaults to the last selected model; prompts on first use) |
 | `-k`, `--api-key` | `OPENAI_API_KEY` | API key, or multiple keys separated by `;;` |
 | `-u`, `--base-url` | `HARNESS_BASE_URL` | Provider base URL(s), separated by `;;` (default `https://api.openai.com/v1`) |
 | `-d`, `--dir` | — | Working directory |
 | `--max-turns` | `HARNESS_MAX_TURNS` | Maximum tool/response turns (default `1000`) |
 | `--system-prompt` | `HARNESS_PROMPT` | Override the system prompt |
 | `--reasoning-effort` | — | `low`, `medium`, `high`, `xhigh`, or `max` (default `high`) |
-| `--context-window` | `HARNESS_CONTEXT_WINDOW` | Token context window (default `1_000_000`) |
+| `--context-window` | `HARNESS_CONTEXT_WINDOW` | Override token context window (otherwise uses model metadata, falling back to `1_000_000`) |
 | `--stream` / `--no-stream` | — | Force streaming on or off |
 | `--no-markdown` | — | Disable markdown rendering |
 | — | `HARNESS_TLS_INSECURE` | Set to `true` to disable TLS certificate verification for API and model requests |
@@ -116,21 +127,30 @@ The CLI options and environment variables mirror the Python implementation.
 
 ### Interactive commands
 
-While the agent is running, you can type:
+At the `›` prompt, you can type:
 
 | Command | Description |
 |---------|-------------|
+| `/help` | Show commands and keyboard shortcuts |
 | `/exit` | Quit the session |
 | `/clear` | Clear conversation history and redraw the welcome box |
 | `/stream` | Toggle streaming mode |
 | `/login` | Save a provider URL and API key for future sessions |
-| `/models` | Fetch and switch models from the configured providers |
+| `/models` | Fetch and switch models (type to filter long lists) |
 | `/reasoning` | Switch reasoning effort |
 | `/context` | Paste a custom context block |
 | `/context clear` | Remove the custom context |
 | `/context show` | Show the current custom context |
 
-Type `/login` to enter an OpenAI-compatible provider base URL (including `/v1` when required) and API key. The key is hidden during interactive entry. Press Enter at either prompt to cancel. The provider is tried first, with existing providers retained as fallbacks; logging in again to the same URL updates its key. Credentials persist in a local JSON file: `~/Library/Application Support/Harness/providers.json` on macOS, `$XDG_CONFIG_HOME/harness/providers.json` (or `~/.config/harness/providers.json`) on Linux, and `%APPDATA%\Harness\providers.json` on Windows. Keys are stored as plain text; on macOS/Linux the directory and file are restricted to your user (700/600). Saved providers load automatically when no API key or custom base URL is supplied through CLI/environment options. Explicit credentials take precedence for that launch. Use `/models` afterward to choose a model supported by the provider.
+Keyboard shortcuts: **Tab** / **Shift+Tab** cycle the reasoning effort
+(or complete a command when the line starts with `/`), **Esc** interrupts
+the agent while it works (a second Ctrl+C during an interrupt quits),
+**↑/↓** browse history,
+ending a line with **`\`** continues the message on the next line,
+**Ctrl+C** clears the current input (press twice to quit), and **Ctrl+D**
+quits. Input history is stored as `history` next to `providers.json`.
+
+Type `/login` to enter an OpenAI-compatible provider base URL (including `/v1` when required) and API key. The key is hidden during interactive entry. Press Enter at either prompt to cancel. The provider is tried first, with existing providers retained as fallbacks; logging in again to the same URL updates its key. Credentials persist in a local JSON file: `~/Library/Application Support/Harness/providers.json` on macOS, `$XDG_CONFIG_HOME/harness/providers.json` (or `~/.config/harness/providers.json`) on Linux, and `%APPDATA%\Harness\providers.json` on Windows. Keys are stored as plain text; on macOS/Linux the directory and file are restricted to your user (700/600). Saved providers load automatically when no API key or custom base URL is supplied through CLI/environment options. Explicit credentials take precedence for that launch. Startup prompts for a provider when none is configured, and for a model when no previous selection exists. The last selected model is saved in `last-model.json` beside the provider configuration and restored on later launches; `--model` or `HARNESS_MODEL` takes precedence. Use `/models` (or `/model`) to switch models. Context-window metadata from the provider’s `/models` response is applied on startup and model changes, with `1_000_000` as the fallback when metadata is absent. `--context-window` or `HARNESS_CONTEXT_WINDOW` overrides that metadata.
 
 The default system prompt identifies the current platform and actual tool shell: PowerShell on Windows and `/bin/sh` on macOS/Linux. On macOS it also directs the model to use macOS/BSD command options. A custom `--system-prompt` still overrides the default.
 

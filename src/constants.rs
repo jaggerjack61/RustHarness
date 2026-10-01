@@ -1,6 +1,5 @@
 pub const DEFAULT_MAX_TURNS: usize = 1_000;
 pub const DEFAULT_CONTEXT_WINDOW: i64 = 1_000_000;
-pub const DEFAULT_MODEL: &str = "deepseek-v4-pro";
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_REASONING_EFFORT: &str = "high";
 

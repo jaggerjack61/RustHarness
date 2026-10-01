@@ -2,14 +2,16 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::Rng;
 use reqwest::blocking::{Client, Response};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::cancel::CancelToken;
 use crate::constants::{
     CONTEXT_WINDOW_TRIM_THRESHOLD, DEFAULT_BASE_URL, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TURNS,
     MAX_RETRIES, RECENT_TURNS_TO_KEEP, RETRY_BASE_DELAY_SECS, SUMMARY_MAX_TOKENS,
@@ -28,6 +30,57 @@ pub enum HarnessError {
     InvalidResponse(String),
     #[error("stream read failed: {0}")]
     Stream(#[from] std::io::Error),
+    #[error("interrupted by the user")]
+    Cancelled,
+}
+
+/// How often blocking waits check whether the user cancelled the turn.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Run blocking `work` on a helper thread so the caller can stop waiting when
+/// `cancel` fires. An abandoned worker finishes in the background.
+fn cancellable<T: Send + 'static>(
+    cancel: &CancelToken,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, HarnessError> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    recv_cancellable(&receiver, cancel)?
+        .ok_or_else(|| HarnessError::InvalidResponse("request worker stopped unexpectedly".into()))
+}
+
+/// Receive the next value, or `None` once the sender is gone.
+fn recv_cancellable<T>(
+    receiver: &Receiver<T>,
+    cancel: &CancelToken,
+) -> Result<Option<T>, HarnessError> {
+    loop {
+        if cancel.is_cancelled() {
+            return Err(HarnessError::Cancelled);
+        }
+        match receiver.recv_timeout(CANCEL_POLL_INTERVAL) {
+            Ok(value) => return Ok(Some(value)),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+}
+
+/// Sleep for `duration`, waking early with an error if the turn is cancelled.
+fn sleep_cancellable(duration: Duration, cancel: &CancelToken) -> Result<(), HarnessError> {
+    let deadline = Instant::now() + duration;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(HarnessError::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        thread::sleep(remaining.min(CANCEL_POLL_INTERVAL));
+    }
 }
 
 impl HarnessError {
@@ -117,6 +170,7 @@ pub struct AgentHarness {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     last_prompt_tokens: u64,
+    cancel: CancelToken,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -137,6 +191,8 @@ impl AgentHarness {
             .or_else(|| env::var("OPENAI_API_KEY").ok())
             .filter(|value| !value.is_empty());
         let endpoints = build_endpoints(api_key.as_deref(), &config.base_url);
+        let tool_registry = ToolRegistry::new(config.working_dir);
+        let cancel = tool_registry.cancel.clone();
         Ok(Self {
             client,
             endpoints,
@@ -146,14 +202,21 @@ impl AgentHarness {
             max_turns: config.max_turns,
             reasoning_effort: config.reasoning_effort,
             context_window: config.context_window,
-            tool_registry: ToolRegistry::new(config.working_dir),
+            tool_registry,
             messages: Vec::new(),
             custom_context: None,
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
             last_prompt_tokens: 0,
+            cancel,
         })
+    }
+
+    /// Token that stops the running turn (and any running command) when cancelled.
+    /// It is reset at the start of every turn.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
     }
 
     pub fn add_provider(&mut self, base_url: &str, api_key: &str) {
@@ -215,6 +278,7 @@ impl AgentHarness {
         stream: bool,
         mut callback: Option<&mut Callback<'_>>,
     ) -> Result<String, HarnessError> {
+        self.cancel.reset();
         let mut rollback_messages = self.messages.clone();
         if self.messages.is_empty() {
             self.messages = self.build_initial_messages(prompt);
@@ -228,7 +292,9 @@ impl AgentHarness {
                 if turn_index > 0 {
                     emit(&mut callback, Event::TurnStart);
                 }
+                self.check_cancelled()?;
                 self.trim_history(&mut callback);
+                self.check_cancelled()?;
 
                 let mut body = self.build_create_body();
                 if stream {
@@ -237,9 +303,9 @@ impl AgentHarness {
                 }
                 let response = self.send_with_retry(&body)?;
                 let processed = if stream {
-                    process_stream(response, &mut callback)?
+                    process_stream(response, &mut callback, &self.cancel)?
                 } else {
-                    let value: Value = response.json()?;
+                    let value: Value = cancellable(&self.cancel, move || response.json())??;
                     parse_response(&value)?
                 };
 
@@ -301,26 +367,37 @@ impl AgentHarness {
         body
     }
 
+    fn check_cancelled(&self) -> Result<(), HarnessError> {
+        if self.cancel.is_cancelled() {
+            Err(HarnessError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     fn send_with_retry(&self, body: &Value) -> Result<Response, HarnessError> {
         for attempt in 0..=MAX_RETRIES {
             let endpoint_index = self.endpoint_index_for_attempt(attempt);
             let provider = &self.endpoints[endpoint_index];
-            let endpoint = format!("{}/chat/completions", provider.base_url);
-            let response = self
+            let request = self
                 .client
-                .post(&endpoint)
+                .post(format!("{}/chat/completions", provider.base_url))
                 .bearer_auth(&provider.api_key)
-                .json(body)
-                .send()
-                .map_err(HarnessError::Transport)
-                .and_then(api_response);
+                .json(body);
+            let response = cancellable(&self.cancel, move || {
+                request
+                    .send()
+                    .map_err(HarnessError::Transport)
+                    .and_then(api_response)
+            })
+            .and_then(|response| response);
 
             match response {
                 Ok(response) => return Ok(response),
                 Err(error) if attempt < MAX_RETRIES && error.retryable() => {
                     let jitter = rand::thread_rng().gen_range(0.0..0.5);
                     let delay = RETRY_BASE_DELAY_SECS * 2_f64.powi(attempt as i32) + jitter;
-                    thread::sleep(Duration::from_secs_f64(delay));
+                    sleep_cancellable(Duration::from_secs_f64(delay), &self.cancel)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -354,6 +431,14 @@ impl AgentHarness {
                 })
             })
             .collect();
+        if let Some(text) = text.as_ref().filter(|text| !text.is_empty()) {
+            emit(
+                callback,
+                Event::TextEnd {
+                    content: text.clone(),
+                },
+            );
+        }
         self.messages.push(json!({
             "role": "assistant",
             "content": text,
@@ -361,6 +446,15 @@ impl AgentHarness {
         }));
 
         for call in tool_calls {
+            if self.cancel.is_cancelled() {
+                // Keep the history valid: every tool call needs a matching result.
+                self.messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": "Error: Cancelled by the user before this tool ran.",
+                }));
+                continue;
+            }
             emit(
                 callback,
                 Event::ToolCall {
@@ -381,10 +475,6 @@ impl AgentHarness {
                 "tool_call_id": call.id,
                 "content": result,
             }));
-        }
-
-        if let Some(text) = text.filter(|text| !text.is_empty()) {
-            emit(callback, Event::TextEnd { content: text });
         }
     }
 
@@ -760,10 +850,21 @@ struct StreamState {
 fn process_stream(
     response: Response,
     callback: &mut Option<&mut Callback<'_>>,
+    cancel: &CancelToken,
 ) -> Result<ProcessedResponse, HarnessError> {
+    // Read on a helper thread so a stalled stream can still be cancelled.
+    let (sender, lines) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(response).lines() {
+            let failed = line.is_err();
+            if sender.send(line).is_err() || failed {
+                break;
+            }
+        }
+    });
     let mut state = StreamState::default();
     let mut event_data = Vec::new();
-    for line in BufReader::new(response).lines() {
+    while let Some(line) = recv_cancellable(&lines, cancel)? {
         let line = line?;
         if line.is_empty() {
             if !event_data.is_empty()

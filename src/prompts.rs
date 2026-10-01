@@ -1,6 +1,14 @@
 use std::io::{self, IsTerminal, Write};
 
-use dialoguer::{Input, Select};
+use console::{Style, style};
+use dialoguer::theme::ColorfulTheme;
+use dialoguer::{FuzzySelect, Input, Select};
+
+use crate::ui;
+
+/// Lists longer than this get type-to-filter selection.
+const FUZZY_THRESHOLD: usize = 12;
+const VISIBLE_ROWS: usize = 12;
 
 const SEPARATOR: &str = "──────────────────────────────────────────────────";
 
@@ -61,16 +69,25 @@ pub fn prompt_selection_numeric<S: AsRef<str>>(
     print!("{}", numeric_menu(options, current, title, current_label));
     let _ = io::stdout().flush();
 
-    let choice = match Input::<String>::new()
-        .with_prompt("Select number (or press Enter to cancel)")
-        .allow_empty(true)
-        .report(false)
-        .interact_text()
-    {
-        Ok(choice) => choice,
-        Err(_) => {
-            println!("\nCancelled.");
-            return None;
+    let choice = if io::stdin().is_terminal() {
+        match Input::<String>::new()
+            .with_prompt("Select number (or press Enter to cancel)")
+            .allow_empty(true)
+            .report(false)
+            .interact_text()
+        {
+            Ok(choice) => choice,
+            Err(_) => {
+                println!("\nCancelled.");
+                return None;
+            }
+        }
+    } else {
+        print!("Select number (or press Enter to cancel): ");
+        let _ = io::stdout().flush();
+        match crate::input::read_line() {
+            Ok(Some(choice)) => choice,
+            _ => return None,
         }
     };
 
@@ -78,17 +95,45 @@ pub fn prompt_selection_numeric<S: AsRef<str>>(
         Ok(Some(index)) => Some(options[index].as_ref().to_owned()),
         Ok(None) => None,
         Err(NumericSelectionError::NotANumber) => {
-            println!("❌ Invalid input. Please enter a number.");
+            ui::error("Invalid input. Please enter a number.");
             None
         }
         Err(NumericSelectionError::OutOfRange) => {
-            println!("❌ Invalid selection. Please enter 1-{}.", options.len());
+            ui::error(&format!(
+                "Invalid selection. Please enter 1-{}.",
+                options.len()
+            ));
             None
         }
     }
 }
 
-/// Let the user choose with arrow keys, falling back to a numeric prompt.
+/// Dialoguer theme matching the CLI palette.
+pub fn theme() -> ColorfulTheme {
+    if !ui::styled() {
+        console::set_colors_enabled_stderr(false);
+    }
+    let accent = Style::new().for_stderr().color256(75);
+    let muted = Style::new().for_stderr().color256(245);
+    ColorfulTheme {
+        prompt_prefix: style("?".to_owned()).for_stderr().color256(75).bold(),
+        prompt_suffix: style("›".to_owned()).for_stderr().color256(245),
+        success_prefix: style("✓".to_owned()).for_stderr().color256(78),
+        success_suffix: style("·".to_owned()).for_stderr().color256(245),
+        error_prefix: style("✗".to_owned()).for_stderr().color256(203),
+        hint_style: muted.clone(),
+        values_style: accent.clone(),
+        active_item_style: accent.clone().bold(),
+        active_item_prefix: style("›".to_owned()).for_stderr().color256(75).bold(),
+        inactive_item_prefix: style(" ".to_owned()).for_stderr(),
+        picked_item_prefix: style("›".to_owned()).for_stderr().color256(75),
+        fuzzy_match_highlight_style: Style::new().for_stderr().color256(75).bold().underlined(),
+        ..ColorfulTheme::default()
+    }
+}
+
+/// Let the user choose with arrow keys (and type-to-filter for long lists),
+/// falling back to a numeric prompt when stdin is not a terminal.
 pub fn prompt_selection<S: AsRef<str>>(
     options: &[S],
     current: &str,
@@ -96,7 +141,7 @@ pub fn prompt_selection<S: AsRef<str>>(
     current_label: &str,
 ) -> Option<String> {
     if options.is_empty() {
-        println!("No options available.");
+        ui::hint("Nothing to choose from.");
         return None;
     }
 
@@ -104,27 +149,51 @@ pub fn prompt_selection<S: AsRef<str>>(
         return prompt_selection_numeric(options, current, title, current_label);
     }
 
-    println!("\n{title}:");
-    println!("{SEPARATOR}");
-    println!("{current_label}: {current}");
-    println!("Use ↑/↓ to navigate, Enter to select, Esc to cancel.\n");
-
     let items: Vec<&str> = options.iter().map(|option| option.as_ref()).collect();
     let default = items
         .iter()
         .position(|option| *option == current)
         .unwrap_or(0);
-    match Select::new()
-        .items(&items)
-        .default(default)
-        .clear(false)
-        .report(false)
-        .interact_opt()
-    {
+    let fuzzy = items.len() > FUZZY_THRESHOLD;
+    println!();
+    let keys = if fuzzy {
+        "↑/↓ move · type to filter · Enter select · Esc cancel"
+    } else {
+        "↑/↓ move · Enter select · Esc cancel"
+    };
+    let width = termimad::crossterm::terminal::size()
+        .map_or(80, |(width, _)| usize::from(width))
+        .saturating_sub(1);
+    ui::hint(&ui::truncate(&format!("{current_label}: {current}"), width));
+    ui::hint(&ui::truncate(keys, width));
+    let theme = theme();
+    let result = if fuzzy {
+        FuzzySelect::with_theme(&theme)
+            .with_prompt(title)
+            .items(&items)
+            .default(default)
+            .max_length(VISIBLE_ROWS)
+            .report(false)
+            .interact_opt()
+    } else {
+        Select::with_theme(&theme)
+            .with_prompt(title)
+            .items(&items)
+            .default(default)
+            .max_length(VISIBLE_ROWS)
+            .report(false)
+            .interact_opt()
+    };
+    match result {
         Ok(Some(index)) => Some(items[index].to_owned()),
-        Ok(None) => None,
+        Ok(None) => {
+            ui::hint("Cancelled.");
+            None
+        }
         Err(error) => {
-            println!("❌ Interactive selection failed ({error}); falling back to numeric input.");
+            ui::error(&format!(
+                "Interactive selection failed ({error}); falling back to numeric input."
+            ));
             prompt_selection_numeric(options, current, title, current_label)
         }
     }

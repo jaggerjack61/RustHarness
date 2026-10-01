@@ -6,13 +6,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use path_clean::PathClean;
 use serde_json::{Map, Value, json};
 use wait_timeout::ChildExt;
 
+use crate::cancel::CancelToken;
 use crate::constants::{BASH_TIMEOUT_SECS, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES};
+
+/// How often a running command checks for cancellation.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 static WINDOWS_SHELL: OnceLock<String> = OnceLock::new();
 
@@ -551,12 +555,63 @@ pub fn run_bash(command: &str, cwd: Option<&Path>) -> String {
     if command.is_empty() {
         return "Error: command must be a non-empty string.".to_owned();
     }
-    run_bash_with_timeout(command, cwd, Duration::from_secs(BASH_TIMEOUT_SECS))
+    run_bash_with_timeout(command, cwd, Duration::from_secs(BASH_TIMEOUT_SECS), None)
 }
 
-fn run_bash_with_timeout(command: &str, cwd: Option<&Path>, timeout: Duration) -> String {
+/// Wait for `child` until it exits, `timeout` elapses (`Ok(None)`), or `cancel` fires.
+fn wait_cancellable(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    cancel: Option<&CancelToken>,
+) -> io::Result<WaitOutcome> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.is_some_and(CancelToken::is_cancelled) {
+            return Ok(WaitOutcome::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(WaitOutcome::TimedOut);
+        }
+        if let Some(status) = child.wait_timeout(remaining.min(CANCEL_POLL_INTERVAL))? {
+            return Ok(WaitOutcome::Exited(status));
+        }
+    }
+}
+
+enum WaitOutcome {
+    Exited(ExitStatus),
+    TimedOut,
+    Cancelled,
+}
+
+/// Kill the shell and, on Unix, every process in its process group.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: kill(2) has no memory-safety preconditions; a negative pid targets
+        // the process group created for this child.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_bash_with_timeout(
+    command: &str,
+    cwd: Option<&Path>,
+    timeout: Duration,
+    cancel: Option<&CancelToken>,
+) -> String {
     let mut process = shell_command(command);
-    process.stdout(Stdio::piped()).stderr(Stdio::piped());
+    process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut process, 0);
     if let Some(cwd) = cwd {
         process.current_dir(cwd);
     }
@@ -570,11 +625,16 @@ fn run_bash_with_timeout(command: &str, cwd: Option<&Path>, timeout: Duration) -
     let stdout_reader = thread::spawn(move || read_all_bounded(stdout));
     let stderr_reader = thread::spawn(move || read_all_bounded(stderr));
 
-    let status = match child.wait_timeout(timeout) {
-        Ok(Some(status)) => status,
-        Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
+    let status = match wait_cancellable(&mut child, timeout, cancel) {
+        Ok(WaitOutcome::Exited(status)) => status,
+        Ok(WaitOutcome::Cancelled) => {
+            kill_tree(&mut child);
+            drop(stdout_reader);
+            drop(stderr_reader);
+            return "Error: Command interrupted by the user.".to_owned();
+        }
+        Ok(WaitOutcome::TimedOut) => {
+            kill_tree(&mut child);
             // Readers are detached deliberately: a grandchild may still hold a
             // copied pipe handle after the shell itself has been terminated.
             drop(stdout_reader);
@@ -585,8 +645,7 @@ fn run_bash_with_timeout(command: &str, cwd: Option<&Path>, timeout: Duration) -
             );
         }
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             return format!("Error executing command: {error}");
         }
     };
@@ -731,11 +790,16 @@ fn command_exists(command: &str) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct ToolRegistry {
     pub working_dir: Option<PathBuf>,
+    /// Interrupts long-running commands when the user cancels a turn.
+    pub cancel: CancelToken,
 }
 
 impl ToolRegistry {
     pub fn new(working_dir: Option<PathBuf>) -> Self {
-        Self { working_dir }
+        Self {
+            working_dir,
+            cancel: CancelToken::new(),
+        }
     }
 
     pub fn with_working_dir(working_dir: impl Into<PathBuf>) -> Self {
@@ -833,7 +897,12 @@ impl ToolRegistry {
             return "Error: 'command' is required and must be a non-empty string for bash tool."
                 .to_owned();
         }
-        run_bash(command, self.working_dir.as_deref())
+        run_bash_with_timeout(
+            command,
+            self.working_dir.as_deref(),
+            Duration::from_secs(BASH_TIMEOUT_SECS),
+            Some(&self.cancel),
+        )
     }
 }
 
@@ -1107,8 +1176,27 @@ mod tests {
         let sleep = "Start-Sleep -Seconds 2";
         #[cfg(not(windows))]
         let sleep = "sleep 2";
-        let result = run_bash_with_timeout(sleep, None, Duration::from_millis(20));
+        let result = run_bash_with_timeout(sleep, None, Duration::from_millis(20), None);
         assert!(result.contains("timed out"));
+    }
+
+    #[test]
+    fn cancellation_interrupts_running_commands() {
+        #[cfg(windows)]
+        let sleep = "Start-Sleep -Seconds 10";
+        #[cfg(not(windows))]
+        let sleep = "sleep 10 | cat";
+        let cancel = CancelToken::new();
+        let trigger = cancel.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let result = run_bash_with_timeout(sleep, None, Duration::from_secs(10), Some(&cancel));
+        canceller.join().unwrap();
+        assert!(result.contains("interrupted by the user"), "{result}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

@@ -49,7 +49,27 @@ pub(crate) fn load(path: &Path) -> Result<Vec<SavedProvider>> {
     Ok(providers)
 }
 
+pub(crate) fn load_model(path: &Path) -> Result<Option<String>> {
+    match fs::read(path) {
+        Ok(contents) => {
+            let model: String = serde_json::from_slice(&contents)
+                .with_context(|| format!("invalid model config in {}", path.display()))?;
+            Ok((!model.trim().is_empty()).then_some(model))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
+    }
+}
+
+pub(crate) fn save_model(path: &Path, model: &str) -> Result<()> {
+    save_json(path, &model)
+}
+
 pub(crate) fn save(path: &Path, providers: &[SavedProvider]) -> Result<()> {
+    save_json(path, &providers)
+}
+
+fn save_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let directory = path
         .parent()
         .context("provider config has no parent directory")?;
@@ -62,7 +82,7 @@ pub(crate) fn save(path: &Path, providers: &[SavedProvider]) -> Result<()> {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         }
     }
-    let contents = serde_json::to_vec_pretty(providers)?;
+    let contents = serde_json::to_vec_pretty(value)?;
     let mut file = tempfile::NamedTempFile::new_in(directory)?;
     #[cfg(unix)]
     {
@@ -101,6 +121,21 @@ pub(crate) fn validate_url(input: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_selected_model_survives_restarts_and_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("harness/last-model.json");
+        assert_eq!(load_model(&path).unwrap(), None);
+        save_model(&path, "first-model").unwrap();
+        assert_eq!(load_model(&path).unwrap().as_deref(), Some("first-model"));
+        save_model(&path, "last-model").unwrap();
+        assert_eq!(load_model(&path).unwrap().as_deref(), Some("last-model"));
+        save_model(&path, "").unwrap();
+        assert_eq!(load_model(&path).unwrap(), None);
+        fs::write(&path, "invalid json").unwrap();
+        assert!(load_model(&path).is_err());
+    }
 
     #[test]
     fn credentials_survive_reload_and_have_private_permissions() {

@@ -11,24 +11,28 @@ fn markdown_skin() -> &'static MadSkin {
 
     SKIN.get_or_init(|| {
         let mut skin = MadSkin::default_dark();
-        let code_background = gray(3);
+        let accent = Color::AnsiValue(75);
+        let muted = Color::AnsiValue(245);
+        let code = Color::AnsiValue(116);
 
-        skin.inline_code = CompoundStyle::with_fgbg(Color::Cyan, code_background);
-        skin.code_block.set_fgbg(Color::Cyan, code_background);
-        skin.bold.set_fg(Color::White);
-        skin.bullet.set_fg(Color::Cyan);
-        skin.quote_mark.set_fg(Color::DarkGrey);
-        skin.horizontal_rule.set_fg(Color::DarkGrey);
-        skin.table.set_fg(Color::White);
+        skin.inline_code = CompoundStyle::with_fg(code);
+        skin.code_block.set_fgbg(code, gray(2));
+        skin.bold.set_fg(Color::Reset);
+        skin.bold.add_attr(Attribute::Bold);
+        skin.italic.add_attr(Attribute::Italic);
+        skin.bullet.set_fg(accent);
+        skin.quote_mark.set_fg(muted);
+        skin.horizontal_rule.set_fg(muted);
+        skin.table.set_fg(muted);
 
         for header in &mut skin.headers {
             header.compound_style.remove_attr(Attribute::Underlined);
             header.add_attr(Attribute::Bold);
-            header.set_fg(Color::White);
+            header.set_fg(Color::Reset);
+            header.align = termimad::Alignment::Left;
         }
-        for header in &mut skin.headers[2..] {
-            header.set_fg(Color::Grey);
-        }
+        skin.headers[0].set_fg(accent);
+        skin.headers[1].set_fg(accent);
 
         skin
     })
@@ -47,6 +51,33 @@ pub fn render_markdown(text: &str) {
         plain_skin()
     };
     skin.print_text(text);
+}
+
+/// Render Markdown into terminal lines no wider than `width`, without leading or
+/// trailing blank lines. ANSI styling is applied only when `styled` is true.
+pub fn markdown_lines(text: &str, width: usize, styled: bool) -> Vec<String> {
+    let skin = if styled {
+        markdown_skin()
+    } else {
+        plain_skin()
+    };
+    let rendered = skin
+        .text(text, Some(width.max(MIN_RENDER_WIDTH)))
+        .to_string();
+    let lines: Vec<String> = rendered
+        .lines()
+        .map(|line| line.trim_end().to_owned())
+        .collect();
+    let is_blank = |line: &String| crate::ui::visible_width(line) == 0 && !line.contains('\x1b');
+    let start = lines
+        .iter()
+        .position(|line| !is_blank(line))
+        .unwrap_or(lines.len());
+    let end = lines
+        .iter()
+        .rposition(|line| !is_blank(line))
+        .map_or(start, |end| end + 1);
+    lines[start..end].to_vec()
 }
 
 /// Convert Markdown to terminal-shaped plain text without ANSI escape sequences.
@@ -101,8 +132,19 @@ mod tests {
     fn terminal_skin_avoids_magenta_for_primary_elements() {
         let skin = markdown_skin();
 
-        assert_eq!(skin.inline_code.get_fg(), Some(Color::Cyan));
-        assert_eq!(skin.headers[0].compound_style.get_fg(), Some(Color::White));
+        assert_ne!(skin.inline_code.get_fg(), Some(Color::Magenta));
+        assert_ne!(
+            skin.headers[0].compound_style.get_fg(),
+            Some(Color::Magenta)
+        );
         assert_ne!(skin.bullet.get_fg(), Some(Color::Magenta));
+    }
+
+    #[test]
+    fn markdown_lines_trim_surrounding_blank_lines_and_fit_width() {
+        let lines = markdown_lines("\n\n# Title\n\nSome body text that wraps.\n\n", 12, false);
+        assert!(lines.first().is_some_and(|line| line.contains("Title")));
+        assert!(lines.last().is_some_and(|line| !line.trim().is_empty()));
+        assert!(lines.iter().all(|line| line.chars().count() <= 12));
     }
 }
