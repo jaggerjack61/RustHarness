@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, ValueEnum};
+use dialoguer::Password;
 use reqwest::blocking::Client;
 use serde_json::Value;
 use termimad::crossterm::terminal;
@@ -22,6 +23,7 @@ use crate::display::ResponseBuffer;
 use crate::events::Event;
 use crate::markdown::render_markdown;
 use crate::prompts::prompt_selection;
+use crate::providers::{self, SavedProvider};
 
 const LIVE_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -140,6 +142,8 @@ fn run_with(args: Cli) -> Result<()> {
         .working_dir
         .clone()
         .unwrap_or(std::env::current_dir().context("could not determine current directory")?);
+    let provider_path = providers::config_path()?;
+    let mut saved_providers = providers::load(&provider_path)?;
     let mut config = AgentConfig::new(&args.model);
     config.api_key = args.api_key.clone();
     config.base_url = args.base_url.clone();
@@ -149,6 +153,20 @@ fn run_with(args: Cli) -> Result<()> {
     config.context_window = args.context_window;
     if let Some(system_prompt) = args.system_prompt {
         config.system_prompt = system_prompt;
+    }
+    if args.api_key.is_none() && args.base_url == DEFAULT_BASE_URL && !saved_providers.is_empty() {
+        config.base_url = saved_providers
+            .iter()
+            .map(|provider| provider.base_url.as_str())
+            .collect::<Vec<_>>()
+            .join(";;");
+        config.api_key = Some(
+            saved_providers
+                .iter()
+                .map(|provider| provider.api_key.as_str())
+                .collect::<Vec<_>>()
+                .join(";;"),
+        );
     }
     let mut agent = AgentHarness::new(config)?;
     let mut use_stream = args.stream || !args.no_stream;
@@ -165,10 +183,11 @@ fn run_with(args: Cli) -> Result<()> {
     );
     println!();
 
-    let fetcher = ModelFetcher::new(args.base_url.clone(), args.api_key.clone());
+    let (base_url, api_key) = agent.provider_config();
+    let mut fetcher = ModelFetcher::new(base_url.clone(), api_key);
     println!("📦 Loading models in background… Use /models to browse.\n");
     if let Some(warning) =
-        check_reasoning_compatibility(&args.base_url, agent.reasoning_effort.as_deref())
+        check_reasoning_compatibility(&base_url, agent.reasoning_effort.as_deref())
     {
         println!("{warning}\n");
     }
@@ -226,6 +245,35 @@ fn run_with(args: Cli) -> Result<()> {
                     "✅ Streaming {}.",
                     if use_stream { "enabled" } else { "disabled" }
                 );
+                continue;
+            }
+            "/login" => {
+                if let Some((base_url, api_key)) = prompt_login()? {
+                    let mut updated_providers = saved_providers.clone();
+                    updated_providers.retain(|provider| provider.base_url != base_url);
+                    updated_providers.insert(
+                        0,
+                        SavedProvider {
+                            base_url: base_url.clone(),
+                            api_key: api_key.clone(),
+                        },
+                    );
+                    if let Err(error) = providers::save(&provider_path, &updated_providers) {
+                        println!("❌ Could not save provider: {error}");
+                        continue;
+                    }
+                    saved_providers = updated_providers;
+                    agent.add_provider(&base_url, &api_key);
+                    let (urls, keys) = agent.provider_config();
+                    fetcher = ModelFetcher::new(urls, keys);
+                    model_checked = false;
+                    println!("✅ Provider saved. Loading models… Use /models to select a model.");
+                    if let Some(warning) =
+                        check_reasoning_compatibility(&base_url, agent.reasoning_effort.as_deref())
+                    {
+                        println!("{warning}");
+                    }
+                }
                 continue;
             }
             "/models" => {
@@ -339,6 +387,52 @@ fn read_line() -> io::Result<Option<String>> {
     }
 }
 
+fn prompt_login() -> Result<Option<(String, String)>> {
+    println!("\nProvider login (press Enter at either prompt to cancel):");
+    print!("Provider base URL: ");
+    io::stdout().flush()?;
+    let Some(url) = read_line()? else {
+        println!("Cancelled.");
+        return Ok(None);
+    };
+    if url.trim().is_empty() {
+        println!("Cancelled.");
+        return Ok(None);
+    }
+    let url = match providers::validate_url(&url) {
+        Ok(url) => url,
+        Err(error) => {
+            println!("❌ {error}");
+            return Ok(None);
+        }
+    };
+    let key = if io::stdin().is_terminal() {
+        Password::new()
+            .with_prompt("API key")
+            .allow_empty_password(true)
+            .report(false)
+            .interact()?
+    } else {
+        print!("API key: ");
+        io::stdout().flush()?;
+        let Some(key) = read_line()? else {
+            println!("Cancelled.");
+            return Ok(None);
+        };
+        key
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        println!("Cancelled.");
+        return Ok(None);
+    }
+    if key.contains(";;") {
+        println!("❌ Enter one API key per /login.");
+        return Ok(None);
+    }
+    Ok(Some((url, key.to_owned())))
+}
+
 fn read_multiline_context() -> io::Result<Option<String>> {
     println!("\n📝 Enter custom context (end with '.' on a line by itself):");
     let mut lines = Vec::new();
@@ -407,7 +501,7 @@ fn build_welcome_box(
         format!("Streaming:       {}", if streaming { "on" } else { "off" }),
         format!("CWD:             {}", working_dir.display()),
         "─".repeat(40),
-        "Commands:  /exit  /clear  /models  /reasoning".to_owned(),
+        "Commands:  /exit  /clear  /login  /models  /reasoning".to_owned(),
         "           /stream  /context  /context show  /context clear".to_owned(),
     ];
     let inner_width = lines

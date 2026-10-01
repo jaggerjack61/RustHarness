@@ -123,11 +123,16 @@ While the agent is running, you can type:
 | `/exit` | Quit the session |
 | `/clear` | Clear conversation history and redraw the welcome box |
 | `/stream` | Toggle streaming mode |
-| `/models` | Fetch and switch models from the provider |
+| `/login` | Save a provider URL and API key for future sessions |
+| `/models` | Fetch and switch models from the configured providers |
 | `/reasoning` | Switch reasoning effort |
 | `/context` | Paste a custom context block |
 | `/context clear` | Remove the custom context |
 | `/context show` | Show the current custom context |
+
+Type `/login` to enter an OpenAI-compatible provider base URL (including `/v1` when required) and API key. The key is hidden during interactive entry. Press Enter at either prompt to cancel. The provider is tried first, with existing providers retained as fallbacks; logging in again to the same URL updates its key. Credentials persist in a local JSON file: `~/Library/Application Support/Harness/providers.json` on macOS, `$XDG_CONFIG_HOME/harness/providers.json` (or `~/.config/harness/providers.json`) on Linux, and `%APPDATA%\Harness\providers.json` on Windows. Keys are stored as plain text; on macOS/Linux the directory and file are restricted to your user (700/600). Saved providers load automatically when no API key or custom base URL is supplied through CLI/environment options. Explicit credentials take precedence for that launch. Use `/models` afterward to choose a model supported by the provider.
+
+The default system prompt identifies the current platform and actual tool shell: PowerShell on Windows and `/bin/sh` on macOS/Linux. On macOS it also directs the model to use macOS/BSD command options. A custom `--system-prompt` still overrides the default.
 
 ## Library
 

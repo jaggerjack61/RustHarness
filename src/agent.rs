@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::constants::{
     CONTEXT_WINDOW_TRIM_THRESHOLD, DEFAULT_BASE_URL, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TURNS,
-    DEFAULT_SYSTEM_PROMPT, MAX_RETRIES, RECENT_TURNS_TO_KEEP, RETRY_BASE_DELAY_SECS,
-    SUMMARY_MAX_TOKENS,
+    MAX_RETRIES, RECENT_TURNS_TO_KEEP, RETRY_BASE_DELAY_SECS, SUMMARY_MAX_TOKENS,
+    default_system_prompt,
 };
 use crate::events::{Callback, Event};
 use crate::tools::ToolRegistry;
@@ -69,7 +69,7 @@ impl AgentConfig {
             model: model.into(),
             api_key: None,
             base_url: DEFAULT_BASE_URL.to_owned(),
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
+            system_prompt: default_system_prompt(),
             working_dir: None,
             max_turns: DEFAULT_MAX_TURNS,
             reasoning_effort: None,
@@ -154,6 +154,36 @@ impl AgentHarness {
             cached_tokens: 0,
             last_prompt_tokens: 0,
         })
+    }
+
+    pub fn add_provider(&mut self, base_url: &str, api_key: &str) {
+        let base_url = base_url.trim().trim_end_matches('/').to_owned();
+        self.endpoints
+            .retain(|endpoint| endpoint.base_url != base_url);
+        self.endpoints.insert(
+            0,
+            ApiEndpoint {
+                base_url,
+                api_key: api_key.trim().to_owned(),
+            },
+        );
+        self.model_endpoint_indices = None;
+    }
+
+    pub(crate) fn provider_config(&self) -> (String, Option<String>) {
+        let urls = self
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.base_url.as_str())
+            .collect::<Vec<_>>()
+            .join(";;");
+        let keys = self
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.api_key.as_str())
+            .collect::<Vec<_>>()
+            .join(";;");
+        (urls, Some(keys))
     }
 
     pub fn select_model(&mut self, model: impl Into<String>, endpoint_indices: Option<Vec<usize>>) {
@@ -1047,6 +1077,31 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn adding_provider_updates_keys_and_resets_model_routing() {
+        let mut config = AgentConfig::new("test-model");
+        config.api_key = Some("original-key".to_owned());
+        config.base_url = "https://original.example/v1".to_owned();
+        let mut agent = AgentHarness::new(config).unwrap();
+        agent.select_model("test-model", Some(vec![0]));
+        agent
+            .messages
+            .push(json!({"role": "user", "content": "keep history"}));
+        agent.set_custom_context(Some("keep context"));
+        agent.add_provider("https://new.example/v1/", "new-key");
+        assert_eq!(agent.endpoint_index_for_attempt(0), 0);
+        assert_eq!(agent.endpoints[0].base_url, "https://new.example/v1");
+        assert_eq!(agent.endpoints[1].api_key, "original-key");
+        assert!(agent.model_endpoint_indices.is_none());
+        agent.add_provider("https://new.example/v1", "updated-key");
+        assert_eq!(agent.endpoints.len(), 2);
+        assert_eq!(agent.endpoints[0].api_key, "updated-key");
+        assert_eq!(agent.messages.len(), 1);
+        assert_eq!(agent.get_custom_context(), Some("keep context"));
+        let (urls, keys) = agent.provider_config();
+        assert_eq!(build_endpoints(keys.as_deref(), &urls), agent.endpoints);
     }
 
     #[test]
