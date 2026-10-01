@@ -97,6 +97,32 @@ pub(crate) fn save(path: &Path, providers: &[SavedProvider]) -> Result<()> {
     save_json(path, &providers)
 }
 
+pub(crate) fn load_reasoning_effort(path: &Path) -> Result<Option<String>> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", path.display()));
+        }
+    };
+    let effort: String = serde_json::from_slice(&contents)
+        .with_context(|| format!("invalid reasoning effort config in {}", path.display()))?;
+    anyhow::ensure!(
+        crate::constants::REASONING_OPTIONS.contains(&effort.as_str()),
+        "invalid reasoning effort in {}",
+        path.display()
+    );
+    Ok(Some(effort))
+}
+
+pub(crate) fn save_reasoning_effort(path: &Path, effort: &str) -> Result<()> {
+    anyhow::ensure!(
+        crate::constants::REASONING_OPTIONS.contains(&effort),
+        "invalid reasoning effort: {effort}"
+    );
+    save_json(path, &effort)
+}
+
 fn save_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let directory = path
         .parent()
@@ -149,6 +175,29 @@ pub(crate) fn validate_url(input: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_survives_restarts_and_rejects_invalid_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("harness/last-reasoning-effort.json");
+        assert_eq!(load_reasoning_effort(&path).unwrap(), None);
+        for effort in crate::constants::REASONING_OPTIONS {
+            save_reasoning_effort(&path, effort).unwrap();
+            assert_eq!(
+                load_reasoning_effort(&path).unwrap().as_deref(),
+                Some(*effort)
+            );
+        }
+        assert!(save_reasoning_effort(&path, "unknown").is_err());
+        assert_eq!(
+            load_reasoning_effort(&path).unwrap().as_deref(),
+            Some("max")
+        );
+        for invalid in ["invalid json", r#""unknown""#, "null"] {
+            fs::write(&path, invalid).unwrap();
+            assert!(load_reasoning_effort(&path).is_err());
+        }
+    }
 
     #[test]
     fn last_selected_model_survives_restarts_and_updates() {

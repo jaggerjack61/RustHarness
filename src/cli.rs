@@ -85,8 +85,8 @@ struct Cli {
     #[arg(long, env = "HARNESS_PROMPT")]
     system_prompt: Option<String>,
 
-    #[arg(long, value_enum, default_value = DEFAULT_REASONING_EFFORT)]
-    reasoning_effort: ReasoningEffort,
+    #[arg(long, value_enum)]
+    reasoning_effort: Option<ReasoningEffort>,
 
     #[arg(
         long,
@@ -121,6 +121,14 @@ fn parse_positive_i64(value: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("expected a positive integer, got {value:?}"))
 }
 
+fn resolve_reasoning_effort(explicit: Option<ReasoningEffort>, path: &Path) -> Result<String> {
+    match explicit {
+        Some(effort) => Ok(effort.as_str().to_owned()),
+        None => Ok(providers::load_reasoning_effort(path)?
+            .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_owned())),
+    }
+}
+
 pub fn run() -> Result<()> {
     load_executable_env()?;
     run_with(Cli::parse())
@@ -151,6 +159,7 @@ fn run_with(args: Cli) -> Result<()> {
     let provider_path = providers::config_path()?;
     let mut saved_providers = providers::load(&provider_path)?;
     let model_path = provider_path.with_file_name("last-model.json");
+    let reasoning_path = provider_path.with_file_name("last-reasoning-effort.json");
     let saved_model = if args.model.is_none() {
         providers::load_model(&model_path)?
     } else {
@@ -167,7 +176,9 @@ fn run_with(args: Cli) -> Result<()> {
     config.base_url = args.base_url.clone();
     config.working_dir = Some(working_dir.clone());
     config.max_turns = args.max_turns;
-    config.reasoning_effort = Some(args.reasoning_effort.as_str().to_owned());
+    let reasoning_effort = resolve_reasoning_effort(args.reasoning_effort, &reasoning_path)?;
+    providers::save_reasoning_effort(&reasoning_path, &reasoning_effort)?;
+    config.reasoning_effort = Some(reasoning_effort);
     config.context_window = args.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     if let Some(system_prompt) = args.system_prompt {
         config.system_prompt = system_prompt;
@@ -256,10 +267,11 @@ fn run_with(args: Cli) -> Result<()> {
                 .as_deref()
                 .unwrap_or(DEFAULT_REASONING_EFFORT),
         );
-        let input = match prompt.read()? {
+        let input = prompt.read()?;
+        apply_prompt_effort(&mut agent, prompt.effort(), &reasoning_path);
+        let input = match input {
             Input::Line(line) => {
                 interrupted = false;
-                apply_prompt_effort(&mut agent, prompt.effort());
                 line
             }
             Input::Interrupted if !interrupted => {
@@ -384,7 +396,7 @@ fn run_with(args: Cli) -> Result<()> {
                         "Reasoning effort set to {}.",
                         ui::style(&selected, Tone::Bold)
                     ));
-                    agent.reasoning_effort = Some(selected);
+                    apply_prompt_effort(&mut agent, &selected, &reasoning_path);
                 }
                 println!();
                 continue;
@@ -475,11 +487,14 @@ impl Drop for HiddenCursor {
 }
 
 /// Adopt a reasoning effort chosen with Tab at the prompt.
-fn apply_prompt_effort(agent: &mut AgentHarness, effort: &str) {
+fn apply_prompt_effort(agent: &mut AgentHarness, effort: &str, path: &Path) {
     if agent.reasoning_effort.as_deref() == Some(effort) {
         return;
     }
     agent.reasoning_effort = Some(effort.to_owned());
+    if let Err(error) = providers::save_reasoning_effort(path, effort) {
+        ui::error(&format!("Could not save reasoning effort: {error}"));
+    }
     let (base_url, _) = agent.provider_config();
     if let Some(warning) = check_reasoning_compatibility(&base_url, Some(effort)) {
         ui::warning(&warning);
@@ -2037,6 +2052,7 @@ mod tests {
     fn cli_defaults_and_stream_flags_match_python() {
         let args = Cli::try_parse_from(["harness"]).unwrap();
         assert!(args.model.is_none());
+        assert!(args.reasoning_effort.is_none());
         assert!(args.context_window.is_none());
         assert!(!args.no_stream);
 
@@ -2045,6 +2061,47 @@ mod tests {
         let args = Cli::try_parse_from(["harness", "--stream"]).unwrap();
         assert!(args.stream);
         assert!(!args.no_stream);
+    }
+
+    #[test]
+    fn reasoning_effort_restores_saved_selection_and_cli_overrides_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("last-reasoning-effort.json");
+        let args = Cli::try_parse_from(["harness"]).unwrap();
+        assert_eq!(
+            resolve_reasoning_effort(args.reasoning_effort, &path).unwrap(),
+            "high"
+        );
+        providers::save_reasoning_effort(&path, "max").unwrap();
+        assert_eq!(
+            resolve_reasoning_effort(args.reasoning_effort, &path).unwrap(),
+            "max"
+        );
+        let args = Cli::try_parse_from(["harness", "--reasoning-effort", "low"]).unwrap();
+        assert_eq!(
+            resolve_reasoning_effort(args.reasoning_effort, &path).unwrap(),
+            "low"
+        );
+        std::fs::write(&path, "invalid json").unwrap();
+        assert_eq!(
+            resolve_reasoning_effort(args.reasoning_effort, &path).unwrap(),
+            "low"
+        );
+    }
+
+    #[test]
+    fn interactive_reasoning_changes_are_restored_on_the_next_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("last-reasoning-effort.json");
+        let mut config = AgentConfig::new("test-model");
+        config.api_key = Some("test-key".to_owned());
+        config.reasoning_effort = Some("high".to_owned());
+        let mut agent = AgentHarness::new(config).unwrap();
+        for effort in ["low", "medium", "high"] {
+            apply_prompt_effort(&mut agent, effort, &path);
+            assert_eq!(agent.reasoning_effort.as_deref(), Some(effort));
+            assert_eq!(resolve_reasoning_effort(None, &path).unwrap(), effort);
+        }
     }
 
     #[test]
