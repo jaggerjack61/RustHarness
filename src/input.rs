@@ -324,7 +324,7 @@ mod tests {
         let ctx = Context::new(&history);
         let hint = helper.hint("/mod", 4, &ctx).unwrap();
         assert_eq!(hint.completion(), Some("els"));
-        assert!(hint.display().contains("Browse and switch models"));
+        assert!(hint.display().contains("Choose a provider and model"));
         assert!(helper.hint("hello", 5, &ctx).is_none());
         assert!(helper.hint("/", 1, &ctx).is_none());
     }

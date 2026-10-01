@@ -22,7 +22,11 @@ static WINDOWS_SHELL: OnceLock<String> = OnceLock::new();
 
 /// Return the OpenAI function-calling schemas for all supported tools.
 pub fn tool_definitions() -> Vec<Value> {
-    vec![
+    definitions_with_find_backend(choose_find_backend(command_exists))
+}
+
+fn definitions_with_find_backend(backend: Option<&str>) -> Vec<Value> {
+    let mut definitions = vec![
         json!({
             "type": "function",
             "function": {
@@ -121,7 +125,34 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
-    ]
+    ];
+    if let Some(backend) = backend {
+        definitions.push(json!({
+            "type": "function",
+            "function": {
+                "name": "find",
+                "description": format!("Search file contents recursively using {backend}. Returns matching lines with filenames and line numbers. Prefer this tool for content searches; narrow the path to keep output manageable. Regex patterns use extended regular expression syntax. Hidden and ignored files follow the backend's defaults."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Text or regular expression to search for."},
+                        "path": {"type": "string", "description": "File or directory to search, relative or absolute. Defaults to the working directory."},
+                        "ignore_case": {"type": "boolean", "description": "Match without regard to case. Defaults to false."},
+                        "literal": {"type": "boolean", "description": "Treat the pattern as literal text instead of a regex. Defaults to false."}
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }));
+    }
+    for definition in &mut definitions {
+        definition["function"]["parameters"]["properties"]["background"] = json!({
+            "type": "boolean",
+            "default": false,
+            "description": "Run without blocking the agent. Defaults to false. When true, returns a started acknowledgement immediately and delivers the result automatically when finished."
+        });
+    }
+    definitions
 }
 
 /// Discard a response which is too large to safely return to the model.
@@ -605,7 +636,16 @@ fn run_bash_with_timeout(
     timeout: Duration,
     cancel: Option<&CancelToken>,
 ) -> String {
-    let mut process = shell_command(command);
+    run_command_with_timeout(shell_command(command), cwd, timeout, cancel, "bash")
+}
+
+fn run_command_with_timeout(
+    mut process: Command,
+    cwd: Option<&Path>,
+    timeout: Duration,
+    cancel: Option<&CancelToken>,
+    tool_name: &str,
+) -> String {
     process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -661,7 +701,7 @@ fn run_bash_with_timeout(
     let total_bytes = stdout_count.saturating_add(stderr_count);
     if total_bytes > MAX_OUTPUT_BYTES {
         return format!(
-            "Error: The 'bash' tool response exceeded the {}-byte limit ({} UTF-8 bytes returned). The output has been discarded. Please try again with a narrower command or file slice.",
+            "Error: The '{tool_name}' tool response exceeded the {}-byte limit ({} UTF-8 bytes returned). The output has been discarded. Please try again with a narrower command or file slice.",
             format_number(MAX_OUTPUT_BYTES),
             format_number(total_bytes),
         );
@@ -669,6 +709,16 @@ fn run_bash_with_timeout(
     output.extend_from_slice(&stderr);
 
     let mut output = String::from_utf8_lossy(&output).into_owned();
+    if tool_name == "find" && status.code() == Some(1) && output.trim().is_empty() {
+        return "No matches found.".to_owned();
+    }
+    if tool_name == "find" && !status.success() {
+        return format!(
+            "Error searching files: {}\n[Exit code: {}]",
+            output.trim(),
+            exit_code(status)
+        );
+    }
     if !status.success() {
         output.push_str(&format!("\n[Exit code: {}]", exit_code(status)));
     }
@@ -760,7 +810,7 @@ fn choose_windows_shell(
 fn command_exists(command: &str) -> bool {
     let command_path = Path::new(command);
     if command_path.components().count() > 1 {
-        return command_path.is_file();
+        return is_executable(command_path);
     }
 
     let Some(path) = std::env::var_os("PATH") else {
@@ -779,12 +829,71 @@ fn command_exists(command: &str) -> bool {
 
     std::env::split_paths(&path).any(|directory| {
         let plain = directory.join(command);
-        plain.is_file()
-            || (command_path.extension().is_none()
+        is_executable(&plain)
+            || (cfg!(windows)
+                && command_path.extension().is_none()
                 && extensions
                     .iter()
                     .any(|extension| directory.join(format!("{command}{extension}")).is_file()))
     })
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn choose_find_backend(mut available: impl FnMut(&str) -> bool) -> Option<&'static str> {
+    ["rg", "grep"]
+        .into_iter()
+        .find(|candidate| available(candidate))
+}
+
+fn find_command(
+    backend: &str,
+    pattern: &str,
+    path: &str,
+    ignore_case: bool,
+    literal: bool,
+) -> Command {
+    let mut process = Command::new(backend);
+    if backend == "rg" {
+        process.args([
+            "--color=never",
+            "--no-heading",
+            "--with-filename",
+            "--line-number",
+        ]);
+    } else {
+        process.args(["-r", "-n", "-H", "-I", "--exclude-dir=.git"]);
+    }
+    if ignore_case {
+        process.arg("-i");
+    }
+    if literal {
+        process.arg("-F");
+    } else if backend == "grep" {
+        process.arg("-E");
+    }
+    if backend == "rg" {
+        process.arg("--no-config");
+    }
+    process.args(["-e", pattern, "--", path]);
+    process.env_remove("GREP_OPTIONS");
+    process
 }
 
 #[derive(Clone, Debug, Default)]
@@ -813,7 +922,7 @@ impl ToolRegistry {
     /// Execute a named tool. Invalid model-provided arguments are returned as
     /// tool errors rather than panicking or aborting the agent loop.
     pub fn execute<A: Borrow<Value>>(&self, name: &str, arguments: A) -> String {
-        if !matches!(name, "read" | "write" | "edit" | "bash") {
+        if !matches!(name, "read" | "write" | "edit" | "bash" | "find") {
             return format!("Error: Unknown tool: {name}");
         }
         let arguments = arguments.borrow();
@@ -821,11 +930,19 @@ impl ToolRegistry {
             return "Error: tool arguments must be a dict.".to_owned();
         };
 
+        if arguments
+            .get("background")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return "Error: 'background' must be a boolean.".to_owned();
+        }
+
         let result = match name {
             "read" => self.execute_read(arguments),
             "write" => self.execute_write(arguments),
             "edit" => self.execute_edit(arguments),
             "bash" => self.execute_bash(arguments),
+            "find" => self.execute_find(arguments),
             _ => unreachable!("tool name was validated above"),
         };
         enforce_output_limits(result, name)
@@ -888,6 +1005,40 @@ impl ToolRegistry {
         edit_file(path, &edits, self.working_dir.as_deref())
     }
 
+    fn execute_find(&self, arguments: &Map<String, Value>) -> String {
+        let Some(backend) = choose_find_backend(command_exists) else {
+            return "Error: find tool is unavailable; install rg or grep.".to_owned();
+        };
+        let Some(pattern) = arguments
+            .get("pattern")
+            .and_then(Value::as_str)
+            .filter(|pattern| !pattern.is_empty())
+        else {
+            return "Error: 'pattern' is required and must be a non-empty string for find tool."
+                .to_owned();
+        };
+        let path = match arguments.get("path") {
+            None => ".",
+            Some(Value::String(path)) if !path.is_empty() => path.as_str(),
+            _ => return "Error: 'path' must be a non-empty string for find tool.".to_owned(),
+        };
+        let ignore_case = match boolean_argument(arguments, "ignore_case", "find") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let literal = match boolean_argument(arguments, "literal", "find") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        run_command_with_timeout(
+            find_command(backend, pattern, path, ignore_case, literal),
+            self.working_dir.as_deref(),
+            Duration::from_secs(BASH_TIMEOUT_SECS),
+            Some(&self.cancel),
+            "find",
+        )
+    }
+
     fn execute_bash(&self, arguments: &Map<String, Value>) -> String {
         let Some(command) = arguments.get("command").and_then(Value::as_str) else {
             return "Error: 'command' is required and must be a non-empty string for bash tool."
@@ -903,6 +1054,14 @@ impl ToolRegistry {
             Duration::from_secs(BASH_TIMEOUT_SECS),
             Some(&self.cancel),
         )
+    }
+}
+
+fn boolean_argument(arguments: &Map<String, Value>, key: &str, tool: &str) -> Result<bool, String> {
+    match arguments.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        _ => Err(format!("Error: '{key}' must be a boolean for {tool} tool.")),
     }
 }
 
@@ -934,12 +1093,136 @@ mod tests {
             .iter()
             .map(|definition| definition["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["read", "write", "edit", "bash"]);
+        let mut expected = vec!["read", "write", "edit", "bash"];
+        if choose_find_backend(command_exists).is_some() {
+            expected.push("find");
+        }
+        assert_eq!(names, expected);
         for definition in definitions {
             assert_eq!(definition["type"], "function");
             assert!(definition["function"]["description"].is_string());
             assert_eq!(definition["function"]["parameters"]["type"], "object");
         }
+    }
+
+    #[test]
+    fn find_is_advertised_only_when_a_search_backend_is_available() {
+        assert_eq!(choose_find_backend(|_| true), Some("rg"));
+        assert_eq!(
+            choose_find_backend(|candidate| candidate == "grep"),
+            Some("grep")
+        );
+        assert_eq!(choose_find_backend(|_| false), None);
+        for backend in [None, Some("rg"), Some("grep")] {
+            let definitions = definitions_with_find_backend(backend);
+            let find = definitions
+                .iter()
+                .find(|definition| definition["function"]["name"] == "find");
+            assert_eq!(find.is_some(), backend.is_some());
+            if let Some(find) = find {
+                assert_eq!(
+                    find["function"]["parameters"]["required"],
+                    json!(["pattern"])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn find_backends_search_recursively_and_handle_patterns_without_a_shell() {
+        let directory = tempdir().unwrap();
+        fs::create_dir(directory.path().join("nested space")).unwrap();
+        fs::write(
+            directory.path().join("nested space/data.txt"),
+            "Alpha\nalpha.beta\n--needle $(touch injected)\n",
+        )
+        .unwrap();
+        for backend in ["rg", "grep"]
+            .into_iter()
+            .filter(|backend| command_exists(backend))
+        {
+            let search = |pattern: &str, path: &str, ignore_case: bool, literal: bool| {
+                run_command_with_timeout(
+                    find_command(backend, pattern, path, ignore_case, literal),
+                    Some(directory.path()),
+                    Duration::from_secs(5),
+                    None,
+                    "find",
+                )
+            };
+            let output = search("alpha", ".", true, true);
+            assert!(output.contains("data.txt:1:Alpha"), "{backend}: {output}");
+            assert!(
+                output.contains("data.txt:2:alpha.beta"),
+                "{backend}: {output}"
+            );
+            assert!(search("alpha[.]beta", ".", false, false).contains("data.txt:2:alpha.beta"));
+            assert_eq!(
+                search("alpha[.]beta", ".", false, true),
+                "No matches found."
+            );
+            assert!(
+                search("--needle $(touch injected)", "nested space", false, true)
+                    .contains("data.txt:3:--needle")
+            );
+            assert!(!directory.path().join("injected").exists());
+            assert!(search("[", ".", false, false).starts_with("Error searching files:"));
+            assert!(search("alpha", "missing", false, true).starts_with("Error searching files:"));
+        }
+    }
+
+    #[test]
+    fn find_registry_validates_arguments_and_enforces_output_limits() {
+        if choose_find_backend(command_exists).is_none() {
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let registry = ToolRegistry::with_working_dir(directory.path());
+        for arguments in [
+            json!({}),
+            json!({"pattern": ""}),
+            json!({"pattern": 1}),
+            json!({"pattern": "x", "path": false}),
+            json!({"pattern": "x", "literal": "yes"}),
+            json!({"pattern": "x", "ignore_case": 1}),
+        ] {
+            assert!(registry.execute("find", arguments).starts_with("Error:"));
+        }
+        fs::write(
+            directory.path().join("data.txt"),
+            "needle\n".repeat(MAX_OUTPUT_LINES + 1),
+        )
+        .unwrap();
+        assert!(
+            registry
+                .execute("find", json!({"pattern": "needle"}))
+                .contains("line limit")
+        );
+        fs::write(
+            directory.path().join("data.txt"),
+            "needle".repeat(MAX_OUTPUT_BYTES),
+        )
+        .unwrap();
+        assert!(
+            registry
+                .execute("find", json!({"pattern": "needle"}))
+                .contains("'find' tool response exceeded")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_detection_requires_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("rg");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!command_exists(path.to_str().unwrap()));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(command_exists(path.to_str().unwrap()));
+        assert!(!is_executable(directory.path()));
     }
 
     #[test]
@@ -1200,6 +1483,26 @@ mod tests {
     }
 
     #[test]
+    fn all_tool_schemas_offer_optional_background_and_validate_its_type() {
+        for definition in tool_definitions() {
+            let parameters = &definition["function"]["parameters"];
+            assert_eq!(parameters["properties"]["background"]["type"], "boolean");
+            assert_eq!(parameters["properties"]["background"]["default"], false);
+            assert!(
+                !parameters["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("background"))
+            );
+        }
+        let registry = ToolRegistry::default();
+        assert_eq!(
+            registry.execute("read", json!({"path": "unused", "background": "true"})),
+            "Error: 'background' must be a boolean."
+        );
+    }
+
+    #[test]
     fn registry_validates_arguments_and_uses_working_directory() {
         let directory = tempdir().unwrap();
         let registry = ToolRegistry::with_working_dir(directory.path());
@@ -1230,6 +1533,6 @@ mod tests {
             registry.execute("read", json!({"path": "file.txt"})),
             "data"
         );
-        assert_eq!(registry.get_definitions().len(), 4);
+        assert_eq!(registry.get_definitions(), tool_definitions());
     }
 }

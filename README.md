@@ -5,7 +5,8 @@ https://github.com/jaggerjack61/Harness repository's Python
 agent. It keeps the OpenAI-compatible chat-completions protocol, streaming
 SSE responses, reasoning fields, tool calling, retries, context
 summarization, token events, markdown rendering, and the unrestricted
-`read`, `write`, `edit`, and `bash` tools.
+`read`, `write`, `edit`, and `bash` tools, plus a dynamic `find` tool when
+ripgrep (`rg`) or `grep` is installed.
 
 ## Features
 
@@ -13,6 +14,16 @@ summarization, token events, markdown rendering, and the unrestricted
   chat-completions + tool-calling API.
 - **Four built-in tools** — `read`, `write`, `edit`, and `bash` give the model
   full access to the filesystem and shell.
+- **Dynamic content search** — `find` is exposed to the model when `rg` or
+  `grep` is on PATH, preferring `rg`. It searches files recursively and returns
+  filenames, line numbers, and matching text. Supports a search path,
+  case-insensitive matching, and literal text or regex patterns; uses the
+  same timeout, cancellation, and output limits as shell commands.
+- **Background tools** — all tools accept `"background": true` (default `false`).
+  Calls appear in chat immediately while the agent continues working. Completed
+  output is delivered automatically with the original call ID. If other work
+  finishes first, the agent waits for the output and responds to it. Cancellation
+  also stops background commands.
 - **Reasoning / chain-of-thought** — displays `reasoning_content` and similar
   fields from reasoning models as dimmed terminal output.
 - **Markdown rendering** — responses are rendered as rich Markdown with
@@ -42,8 +53,8 @@ summarization, token events, markdown rendering, and the unrestricted
   timeouts) are retried automatically up to 3 times.
 - **Real-time token tracking** — cumulative input/output/cache token counts
   and context-window usage are shown in the status bar.
-- **Model switcher** — `/models` fetches the provider's model list and lets
-  you switch at runtime.
+- **Model switcher** — `/models` lets you choose a provider, then select
+  one of its models at runtime.
 - **Custom context** — `/context` lets you paste a block of text that is kept
   in the system message for the current session.
 - **Cross-platform shell** — PowerShell 7 / Windows PowerShell 5.1 on
@@ -107,6 +118,15 @@ harness.exe --model "kimi-k2.7-code" \
   --api-key "sk-your-api-key"
 ```
 
+OpenCode Zen and Go providers automatically receive an `x-opencode-session`
+header and a `harness-rs` user agent on every model completion request,
+including streaming, retries, tool follow-ups, and context summarization.
+The session ID is generated for each conversation, stays stable across turns
+and provider/model switches, and renews on `/clear` or a new Harness instance.
+This applies to OpenCode URLs supplied through `/login`, saved providers,
+CLI options, environment variables, or the library; no extra configuration
+is needed.
+
 The CLI options and environment variables mirror the Python implementation.
 
 | CLI option | Environment variable | Description |
@@ -135,8 +155,8 @@ At the `›` prompt, you can type:
 | `/exit` | Quit the session |
 | `/clear` | Clear conversation history and redraw the welcome box |
 | `/stream` | Toggle streaming mode |
-| `/login` | Save a provider URL and API key for future sessions |
-| `/models` | Fetch and switch models (type to filter long lists) |
+| `/login` | Save a provider name, URL, and API key for future sessions |
+| `/models` | Choose a provider, then a model (type to filter long lists) |
 | `/reasoning` | Switch reasoning effort |
 | `/context` | Paste a custom context block |
 | `/context clear` | Remove the custom context |
@@ -150,7 +170,7 @@ ending a line with **`\`** continues the message on the next line,
 **Ctrl+C** clears the current input (press twice to quit), and **Ctrl+D**
 quits. Input history is stored as `history` next to `providers.json`.
 
-Type `/login` to enter an OpenAI-compatible provider base URL (including `/v1` when required) and API key. The key is hidden during interactive entry. Press Enter at either prompt to cancel. The provider is tried first, with existing providers retained as fallbacks; logging in again to the same URL updates its key. Credentials persist in a local JSON file: `~/Library/Application Support/Harness/providers.json` on macOS, `$XDG_CONFIG_HOME/harness/providers.json` (or `~/.config/harness/providers.json`) on Linux, and `%APPDATA%\Harness\providers.json` on Windows. Keys are stored as plain text; on macOS/Linux the directory and file are restricted to your user (700/600). Saved providers load automatically when no API key or custom base URL is supplied through CLI/environment options. Explicit credentials take precedence for that launch. Startup prompts for a provider when none is configured, and for a model when no previous selection exists. The last selected model is saved in `last-model.json` beside the provider configuration and restored on later launches; `--model` or `HARNESS_MODEL` takes precedence. Use `/models` (or `/model`) to switch models. Context-window metadata from the provider’s `/models` response is applied on startup and model changes, with `1_000_000` as the fallback when metadata is absent. `--context-window` or `HARNESS_CONTEXT_WINDOW` overrides that metadata.
+Type `/login` to enter a provider name, an OpenAI-compatible provider base URL (including `/v1` when required) and API key. The key is hidden during interactive entry. Press Enter at any prompt to cancel. New providers are added first to the configured list, with existing providers retained; logging in again to the same URL updates its name and key. Credentials persist in a local JSON file: `~/Library/Application Support/Harness/providers.json` on macOS, `$XDG_CONFIG_HOME/harness/providers.json` (or `~/.config/harness/providers.json`) on Linux, and `%APPDATA%\Harness\providers.json` on Windows. Keys are stored as plain text; on macOS/Linux the directory and file are restricted to your user (700/600). Saved providers load automatically when no API key or custom base URL is supplied through CLI/environment options. Explicit credentials take precedence for that launch. Startup prompts for a provider when none is configured, and for a model when no previous selection exists. The last selected model and provider URL are saved in `last-model.json` beside the provider configuration and restored on later launches; `--model` or `HARNESS_MODEL` takes precedence. Use `/models` (or `/model`) to choose a provider, then select a model from its list. Requests and retries use the selected provider, even when another provider offers the same model ID. Providers saved without a name display their URL until renamed through `/login`. Context-window metadata from the provider’s `/models` response is applied on startup and model changes, with `1_000_000` as the fallback when metadata is absent. `--context-window` or `HARNESS_CONTEXT_WINDOW` overrides that metadata.
 
 The default system prompt identifies the current platform and actual tool shell: PowerShell on Windows and `/bin/sh` on macOS/Linux. On macOS it also directs the model to use macOS/BSD command options. A custom `--system-prompt` still overrides the default.
 
@@ -172,7 +192,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Use `AgentHarness::run_with_callback` to receive typed `Event` values and to
-enable streaming.
+enable streaming. Background calls emit the usual `ToolCall` and an immediate
+`ToolResult` acknowledgement. Completion emits `BackgroundToolResult`, including
+`tool_call_id`, `name`, `arguments`, and `result`. Completed output is added to
+conversation history as a notification before the next model request; an
+in-flight model response continues normally.
 
 ```rust,no_run
 use harness_rs::{AgentConfig, AgentHarness};

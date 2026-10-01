@@ -27,13 +27,22 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = r#"You are an expert coding assistant. Y
 - **edit** — Make precise text replacements in files. Each edit specifies oldText and newText.
 - **bash** — Execute commands using the platform shell described below. Use for listing files, running tests, installing packages, etc.
 
+All tools accept an optional background boolean, defaulting to false. Use background: true for independent work that can run while you continue. Background calls return a started acknowledgement; their results arrive automatically in a later message with the tool call ID.
+
 Always use these tools when you need to interact with the file system or execute commands.
 Your tool results may be truncated for display — keep your commands and file reads concise.
 When searching or listing files, limit output using commands supported by the platform shell.
 Be concise and helpful."#;
 
 pub fn default_system_prompt() -> String {
-    system_prompt_for_platform(std::env::consts::OS)
+    let mut prompt = system_prompt_for_platform(std::env::consts::OS);
+    if crate::tools::tool_definitions()
+        .iter()
+        .any(|definition| definition["function"]["name"] == "find")
+    {
+        prompt.push_str("\n\nUse the find tool to search file contents. It returns matching lines with filenames and line numbers; narrow the path or pattern to keep results manageable.");
+    }
+    prompt
 }
 
 fn system_prompt_for_platform(platform: &str) -> String {
@@ -68,9 +77,11 @@ mod tests {
         assert!(windows.contains("PowerShell"));
         assert!(windows.contains("-NoProfile -Command"));
         assert!(!windows.contains("/bin/sh"));
-        assert_eq!(
-            default_system_prompt(),
-            system_prompt_for_platform(std::env::consts::OS)
-        );
+        let prompt = default_system_prompt();
+        assert!(prompt.starts_with(&system_prompt_for_platform(std::env::consts::OS)));
+        let find_available = crate::tools::tool_definitions()
+            .iter()
+            .any(|definition| definition["function"]["name"] == "find");
+        assert_eq!(prompt.contains("Use the find tool"), find_available);
     }
 }

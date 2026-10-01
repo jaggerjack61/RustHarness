@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SavedProvider {
+    #[serde(default)]
+    pub name: String,
     pub base_url: String,
     pub api_key: String,
 }
@@ -49,20 +51,46 @@ pub(crate) fn load(path: &Path) -> Result<Vec<SavedProvider>> {
     Ok(providers)
 }
 
-pub(crate) fn load_model(path: &Path) -> Result<Option<String>> {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SavedModel {
+    pub model: String,
+    pub base_url: Option<String>,
+}
+
+pub(crate) fn load_model(path: &Path) -> Result<Option<SavedModel>> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ModelConfig {
+        Legacy(String),
+        Selection(SavedModel),
+    }
+
     match fs::read(path) {
         Ok(contents) => {
-            let model: String = serde_json::from_slice(&contents)
+            let config: ModelConfig = serde_json::from_slice(&contents)
                 .with_context(|| format!("invalid model config in {}", path.display()))?;
-            Ok((!model.trim().is_empty()).then_some(model))
+            let selection = match config {
+                ModelConfig::Legacy(model) => SavedModel {
+                    model,
+                    base_url: None,
+                },
+                ModelConfig::Selection(selection) => selection,
+            };
+            Ok((!selection.model.trim().is_empty()).then_some(selection))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
     }
 }
 
-pub(crate) fn save_model(path: &Path, model: &str) -> Result<()> {
-    save_json(path, &model)
+pub(crate) fn save_model(path: &Path, model: &str, base_url: Option<&str>) -> Result<()> {
+    save_json(
+        path,
+        &SavedModel {
+            model: model.to_owned(),
+            base_url: base_url.map(str::to_owned),
+        },
+    )
 }
 
 pub(crate) fn save(path: &Path, providers: &[SavedProvider]) -> Result<()> {
@@ -127,14 +155,56 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("harness/last-model.json");
         assert_eq!(load_model(&path).unwrap(), None);
-        save_model(&path, "first-model").unwrap();
-        assert_eq!(load_model(&path).unwrap().as_deref(), Some("first-model"));
-        save_model(&path, "last-model").unwrap();
-        assert_eq!(load_model(&path).unwrap().as_deref(), Some("last-model"));
-        save_model(&path, "").unwrap();
+        save_model(&path, "first-model", None).unwrap();
+        assert_eq!(
+            load_model(&path)
+                .unwrap()
+                .as_ref()
+                .map(|selection| selection.model.as_str()),
+            Some("first-model")
+        );
+        save_model(&path, "last-model", Some("https://provider.example/v1")).unwrap();
+        assert_eq!(
+            load_model(&path)
+                .unwrap()
+                .as_ref()
+                .map(|selection| selection.model.as_str()),
+            Some("last-model")
+        );
+        save_model(&path, "", None).unwrap();
         assert_eq!(load_model(&path).unwrap(), None);
         fs::write(&path, "invalid json").unwrap();
         assert!(load_model(&path).is_err());
+    }
+
+    #[test]
+    fn legacy_configs_load_and_selected_provider_survives_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("providers.json");
+        fs::write(
+            &path,
+            r#"[{"base_url":"https://example.com/v1","api_key":"key"}]"#,
+        )
+        .unwrap();
+        let providers = load(&path).unwrap();
+        assert!(providers[0].name.is_empty());
+        let path = directory.path().join("last-model.json");
+        fs::write(&path, r#""legacy-model""#).unwrap();
+        assert_eq!(
+            load_model(&path).unwrap(),
+            Some(SavedModel {
+                model: "legacy-model".to_owned(),
+                base_url: None,
+            })
+        );
+        save_model(&path, "shared", Some("https://example.com/v1")).unwrap();
+        assert_eq!(
+            load_model(&path).unwrap(),
+            Some(SavedModel {
+                model: "shared".to_owned(),
+                base_url: Some("https://example.com/v1".to_owned()),
+            })
+        );
     }
 
     #[test]
@@ -143,6 +213,7 @@ mod tests {
         let path = directory.path().join("harness/providers.json");
         assert!(load(&path).unwrap().is_empty());
         let mut providers = vec![SavedProvider {
+            name: "Test provider".to_owned(),
             base_url: "https://provider.example/v1".to_owned(),
             api_key: "test-key".to_owned(),
         }];

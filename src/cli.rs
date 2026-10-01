@@ -151,10 +151,17 @@ fn run_with(args: Cli) -> Result<()> {
     let provider_path = providers::config_path()?;
     let mut saved_providers = providers::load(&provider_path)?;
     let model_path = provider_path.with_file_name("last-model.json");
-    let model = match args.model.clone() {
-        Some(model) => Some(model),
-        None => providers::load_model(&model_path)?,
+    let saved_model = if args.model.is_none() {
+        providers::load_model(&model_path)?
+    } else {
+        None
     };
+    let model = args.model.clone().or_else(|| {
+        saved_model
+            .as_ref()
+            .map(|selection| selection.model.clone())
+    });
+    let mut selected_provider = saved_model.and_then(|selection| selection.base_url);
     let mut config = AgentConfig::new(model.unwrap_or_default());
     config.api_key = args.api_key.clone();
     config.base_url = args.base_url.clone();
@@ -164,6 +171,9 @@ fn run_with(args: Cli) -> Result<()> {
     config.context_window = args.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     if let Some(system_prompt) = args.system_prompt {
         config.system_prompt = system_prompt;
+    }
+    if args.api_key.is_some() || args.base_url != DEFAULT_BASE_URL {
+        selected_provider = None;
     }
     if args.api_key.is_none() && args.base_url == DEFAULT_BASE_URL && !saved_providers.is_empty() {
         config.base_url = saved_providers
@@ -186,19 +196,13 @@ fn run_with(args: Cli) -> Result<()> {
         && config.base_url == DEFAULT_BASE_URL
     {
         ui::hint("No provider configured. Add one to get started.");
-        let Some((base_url, api_key)) = prompt_login()? else {
+        let Some(provider) = prompt_login()? else {
             return Ok(());
         };
-        saved_providers.insert(
-            0,
-            SavedProvider {
-                base_url: base_url.clone(),
-                api_key: api_key.clone(),
-            },
-        );
+        config.base_url = provider.base_url.clone();
+        config.api_key = Some(provider.api_key.clone());
+        saved_providers.insert(0, provider);
         providers::save(&provider_path, &saved_providers)?;
-        config.base_url = base_url;
-        config.api_key = Some(api_key);
     }
     let mut agent = AgentHarness::new(config)?;
     let mut use_stream = args.stream || !args.no_stream;
@@ -212,14 +216,27 @@ fn run_with(args: Cli) -> Result<()> {
             !models.is_empty(),
             "No models available. Specify a model with --model or check your provider."
         );
-        let Some(selected) = prompt_selection(&models, "", "Select a model", "Current model")
+        let Some((base_url, selected)) =
+            prompt_provider_model(&fetcher, &saved_providers, "", None)
         else {
             return Ok(());
         };
+        selected_provider = Some(base_url);
         agent.select_model(selected, None);
     }
-    apply_model_metadata(&mut agent, &fetcher, args.context_window);
-    providers::save_model(&model_path, &agent.model)?;
+    if selected_provider
+        .as_ref()
+        .is_some_and(|url| !split_multi(Some(&base_url)).contains(url))
+    {
+        selected_provider = None;
+    }
+    apply_model_metadata(
+        &mut agent,
+        &fetcher,
+        args.context_window,
+        selected_provider.as_deref(),
+    );
+    providers::save_model(&model_path, &agent.model, selected_provider.as_deref())?;
     print_banner(&agent, &working_dir, use_stream);
 
     if let Some(warning) =
@@ -285,16 +302,12 @@ fn run_with(args: Cli) -> Result<()> {
                 continue;
             }
             "/login" => {
-                if let Some((base_url, api_key)) = prompt_login()? {
+                if let Some(provider) = prompt_login()? {
+                    let base_url = provider.base_url.clone();
+                    let api_key = provider.api_key.clone();
                     let mut updated_providers = saved_providers.clone();
                     updated_providers.retain(|provider| provider.base_url != base_url);
-                    updated_providers.insert(
-                        0,
-                        SavedProvider {
-                            base_url: base_url.clone(),
-                            api_key: api_key.clone(),
-                        },
-                    );
+                    updated_providers.insert(0, provider);
                     if let Err(error) = providers::save(&provider_path, &updated_providers) {
                         ui::error(&format!("Could not save provider: {error}"));
                         println!();
@@ -329,13 +342,26 @@ fn run_with(args: Cli) -> Result<()> {
                 fetcher.print_failures();
                 if models.is_empty() {
                     ui::warning("No models available from the configured providers.");
-                } else if let Some(selected) =
-                    prompt_selection(&models, &agent.model, "Select a model", "Current model")
-                {
+                } else if let Some((base_url, selected)) = prompt_provider_model(
+                    &fetcher,
+                    &saved_providers,
+                    &agent.model,
+                    selected_provider.as_deref(),
+                ) {
+                    selected_provider = Some(base_url);
                     agent.select_model(selected, None);
-                    apply_model_metadata(&mut agent, &fetcher, args.context_window);
+                    apply_model_metadata(
+                        &mut agent,
+                        &fetcher,
+                        args.context_window,
+                        selected_provider.as_deref(),
+                    );
                     model_checked = true;
-                    if let Err(error) = providers::save_model(&model_path, &agent.model) {
+                    if let Err(error) = providers::save_model(
+                        &model_path,
+                        &agent.model,
+                        selected_provider.as_deref(),
+                    ) {
                         ui::error(&format!("Could not save model: {error}"));
                     }
                     ui::success(&format!(
@@ -409,7 +435,12 @@ fn run_with(args: Cli) -> Result<()> {
 
         if !model_checked && (fetcher.requires_routing() || fetcher.ready()) {
             let models = fetcher.get();
-            apply_model_metadata(&mut agent, &fetcher, args.context_window);
+            apply_model_metadata(
+                &mut agent,
+                &fetcher,
+                args.context_window,
+                selected_provider.as_deref(),
+            );
             if let Some(warning) = check_model_available(&agent.model, &models) {
                 ui::warning(&warning);
             }
@@ -533,10 +564,26 @@ fn plural(count: usize, noun: &str) -> String {
     }
 }
 
-fn prompt_login() -> Result<Option<(String, String)>> {
+fn prompt_login() -> Result<Option<SavedProvider>> {
     println!();
     ui::hint("Add a provider · leave a field empty to cancel");
     let interactive = io::stdin().is_terminal();
+    let name = if interactive {
+        TextInput::<String>::with_theme(&theme())
+            .with_prompt("Provider name")
+            .allow_empty(true)
+            .interact_text()
+            .unwrap_or_default()
+    } else {
+        print!("Provider name: ");
+        io::stdout().flush()?;
+        read_line()?.unwrap_or_default()
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        ui::hint("Cancelled.");
+        return Ok(None);
+    }
     let url = if interactive {
         TextInput::<String>::with_theme(&theme())
             .with_prompt("Base URL")
@@ -580,7 +627,52 @@ fn prompt_login() -> Result<Option<(String, String)>> {
         ui::error("Enter one API key per /login.");
         return Ok(None);
     }
-    Ok(Some((url, key.to_owned())))
+    Ok(Some(SavedProvider {
+        name: name.to_owned(),
+        base_url: url,
+        api_key: key.to_owned(),
+    }))
+}
+
+fn provider_choices(base_url: &str, saved_providers: &[SavedProvider]) -> Vec<(String, String)> {
+    split_multi(Some(base_url))
+        .into_iter()
+        .map(|url| {
+            let name = saved_providers
+                .iter()
+                .find(|provider| provider.base_url == url)
+                .map(|provider| provider.name.trim())
+                .filter(|name| !name.is_empty());
+            let label = match name {
+                Some(name) => format!("{name} ({url})"),
+                None => url.clone(),
+            };
+            (label, url)
+        })
+        .collect()
+}
+
+fn prompt_provider_model(
+    fetcher: &ModelFetcher,
+    saved_providers: &[SavedProvider],
+    current_model: &str,
+    current_provider: Option<&str>,
+) -> Option<(String, String)> {
+    let choices = provider_choices(&fetcher.base_url, saved_providers);
+    let labels: Vec<&str> = choices.iter().map(|(label, _)| label.as_str()).collect();
+    let current = choices
+        .iter()
+        .find(|(_, url)| Some(url.as_str()) == current_provider)
+        .map_or("", |(label, _)| label.as_str());
+    let selected = prompt_selection(&labels, current, "Select a provider", "Current provider")?;
+    let index = choices.iter().position(|(label, _)| *label == selected)?;
+    let models = fetcher.models_for_provider(index);
+    if models.is_empty() {
+        ui::warning("No models available from this provider.");
+        return None;
+    }
+    let model = prompt_selection(&models, current_model, "Select a model", "Current model")?;
+    Some((choices[index].1.clone(), model))
 }
 
 fn read_multiline_context() -> io::Result<Option<String>> {
@@ -647,6 +739,7 @@ struct ModelCatalog {
     sources: BTreeMap<String, Vec<usize>>,
     failures: Vec<String>,
     context_windows: BTreeMap<String, i64>,
+    provider_context_windows: BTreeMap<(usize, String), i64>,
 }
 
 fn model_context_window(model: &Value) -> Option<i64> {
@@ -672,10 +765,18 @@ fn apply_model_metadata(
     agent: &mut AgentHarness,
     fetcher: &ModelFetcher,
     override_window: Option<i64>,
+    selected_provider: Option<&str>,
 ) {
-    let endpoint_indices = fetcher.endpoint_indices_for(&agent.model);
+    let provider_index = selected_provider.and_then(|url| {
+        split_multi(Some(&fetcher.base_url))
+            .iter()
+            .position(|configured| configured == url)
+    });
+    let endpoint_indices = provider_index
+        .map(|index| vec![index])
+        .or_else(|| fetcher.endpoint_indices_for(&agent.model));
     agent.context_window = override_window
-        .or_else(|| fetcher.context_window_for(&agent.model))
+        .or_else(|| fetcher.context_window_for_provider(&agent.model, provider_index))
         .unwrap_or(DEFAULT_CONTEXT_WINDOW);
     agent.select_model(agent.model.clone(), endpoint_indices);
 }
@@ -691,6 +792,7 @@ fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<ModelCatalog> {
     let mut sources = BTreeMap::<String, Vec<usize>>::new();
     let mut failures = Vec::new();
     let mut context_windows = BTreeMap::new();
+    let mut provider_context_windows = BTreeMap::new();
 
     for (index, configured_url) in urls.iter().enumerate() {
         let url = format!("{}/models", configured_url.trim_end_matches('/'));
@@ -716,6 +818,7 @@ fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<ModelCatalog> {
                     models.insert(model.to_owned());
                     sources.entry(model.to_owned()).or_default().push(index);
                     if let Some(window) = model_context_window(metadata) {
+                        provider_context_windows.insert((index, model.to_owned()), window);
                         context_windows
                             .entry(model.to_owned())
                             .and_modify(|existing: &mut i64| *existing = (*existing).min(window))
@@ -738,6 +841,7 @@ fn fetch_models(base_url: &str, api_key: Option<&str>) -> Result<ModelCatalog> {
         sources,
         failures,
         context_windows,
+        provider_context_windows,
     })
 }
 
@@ -795,6 +899,28 @@ impl ModelFetcher {
             .unwrap_or_default()
     }
 
+    fn models_for_provider(&self, index: usize) -> Vec<String> {
+        self.state
+            .0
+            .lock()
+            .expect("model state poisoned")
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .filter(|model| {
+                        catalog
+                            .sources
+                            .get(*model)
+                            .is_some_and(|indices| indices.contains(&index))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn requires_routing(&self) -> bool {
         self.requires_routing
     }
@@ -808,13 +934,23 @@ impl ModelFetcher {
             .and_then(|catalog| catalog.sources.get(model).cloned())
     }
 
-    fn context_window_for(&self, model: &str) -> Option<i64> {
+    fn context_window_for_provider(
+        &self,
+        model: &str,
+        provider_index: Option<usize>,
+    ) -> Option<i64> {
         self.state
             .0
             .lock()
             .expect("model state poisoned")
             .as_ref()
-            .and_then(|catalog| catalog.context_windows.get(model).copied())
+            .and_then(|catalog| match provider_index {
+                Some(index) => catalog
+                    .provider_context_windows
+                    .get(&(index, model.to_owned()))
+                    .copied(),
+                None => catalog.context_windows.get(model).copied(),
+            })
     }
 
     fn print_failures(&self) {
@@ -880,6 +1016,7 @@ impl Phase {
             Self::Tool(name) => match name.as_str() {
                 "bash" => "Running command".to_owned(),
                 "read" => "Reading".to_owned(),
+                "find" => "Searching files".to_owned(),
                 "write" => "Writing file".to_owned(),
                 "edit" => "Editing".to_owned(),
                 other => format!("Running {other}"),
@@ -1459,6 +1596,15 @@ impl CliDisplay {
                 self.phase = Phase::Waiting;
                 self.refresh_live(true);
             }
+            Event::BackgroundToolResult {
+                name,
+                arguments,
+                result,
+                ..
+            } => {
+                self.print_tool_block(name, arguments, result);
+                self.refresh_live(true);
+            }
             Event::FinishReason { reason, .. } => {
                 let warning = match reason.as_str() {
                     "length" => {
@@ -1513,6 +1659,14 @@ fn tool_header(name: &str, arguments: &Value) -> (String, String) {
             };
             ("Read".to_owned(), format!("{}{range}", text("path")))
         }
+        "find" => (
+            "Find".to_owned(),
+            format!(
+                "{} in {}",
+                text("pattern"),
+                arguments.get("path").and_then(Value::as_str).unwrap_or(".")
+            ),
+        ),
         "write" => ("Write".to_owned(), text("path").to_owned()),
         "edit" => ("Edit".to_owned(), text("path").to_owned()),
         other => (other.to_owned(), format_arguments(arguments)),
@@ -1939,12 +2093,12 @@ mod tests {
             )),
         };
         let mut agent = AgentHarness::new(AgentConfig::new("small")).unwrap();
-        apply_model_metadata(&mut agent, &fetcher, None);
+        apply_model_metadata(&mut agent, &fetcher, None, None);
         assert_eq!(agent.context_window, 32768);
-        apply_model_metadata(&mut agent, &fetcher, Some(8192));
+        apply_model_metadata(&mut agent, &fetcher, Some(8192), None);
         assert_eq!(agent.context_window, 8192);
         agent.select_model("missing", None);
-        apply_model_metadata(&mut agent, &fetcher, None);
+        apply_model_metadata(&mut agent, &fetcher, None, None);
         assert_eq!(agent.context_window, DEFAULT_CONTEXT_WINDOW);
     }
 
@@ -1983,6 +2137,135 @@ mod tests {
         assert_eq!(catalog.context_windows["shared"], 64000);
         assert!(!catalog.context_windows.contains_key("unknown"));
         assert!(catalog.failures.is_empty());
+    }
+
+    #[test]
+    fn provider_selection_filters_shared_models_and_uses_its_metadata() {
+        let first = "https://first.example/v1";
+        let second = "https://second.example/v1";
+        let fetcher = ModelFetcher {
+            base_url: format!("{first};;{second}"),
+            api_key: None,
+            requires_routing: true,
+            state: Arc::new((
+                Mutex::new(Some(ModelCatalog {
+                    models: vec!["first-only".to_owned(), "shared".to_owned()],
+                    sources: BTreeMap::from([
+                        ("first-only".to_owned(), vec![0]),
+                        ("shared".to_owned(), vec![0, 1]),
+                    ]),
+                    context_windows: BTreeMap::from([("shared".to_owned(), 32000)]),
+                    provider_context_windows: BTreeMap::from([
+                        ((0, "shared".to_owned()), 32000),
+                        ((1, "shared".to_owned()), 128000),
+                    ]),
+                    ..ModelCatalog::default()
+                })),
+                Condvar::new(),
+            )),
+        };
+        assert_eq!(fetcher.models_for_provider(0), ["first-only", "shared"]);
+        assert_eq!(fetcher.models_for_provider(1), ["shared"]);
+        assert!(fetcher.models_for_provider(2).is_empty());
+        let mut config = AgentConfig::new("shared");
+        config.base_url = fetcher.base_url.clone();
+        let mut agent = AgentHarness::new(config).unwrap();
+        apply_model_metadata(&mut agent, &fetcher, None, Some(second));
+        assert_eq!(agent.context_window, 128000);
+        apply_model_metadata(&mut agent, &fetcher, Some(8192), Some(second));
+        assert_eq!(agent.context_window, 8192);
+        agent.select_model("first-only", None);
+        apply_model_metadata(&mut agent, &fetcher, None, Some(second));
+        assert_eq!(agent.context_window, DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn restored_provider_selection_routes_shared_models_after_provider_reordering() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let root = format!("http://{}", listener.local_addr().unwrap());
+        let selected_url = format!("{root}/selected");
+        let other_url = format!("{root}/other");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("last-model.json");
+        providers::save_model(&path, "shared", Some(&selected_url)).unwrap();
+        let saved = providers::load_model(&path).unwrap().unwrap();
+        let mut config = AgentConfig::new(saved.model);
+        config.base_url = format!("{other_url};;{selected_url}");
+        config.api_key = Some("other-key;;selected-key".to_owned());
+        let fetcher = ModelFetcher {
+            base_url: config.base_url.clone(),
+            api_key: config.api_key.clone(),
+            requires_routing: true,
+            state: Arc::new((
+                Mutex::new(Some(ModelCatalog {
+                    models: vec!["shared".to_owned()],
+                    sources: BTreeMap::from([("shared".to_owned(), vec![0, 1])]),
+                    ..ModelCatalog::default()
+                })),
+                Condvar::new(),
+            )),
+        };
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut byte = [0];
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    bytes.push(byte[0]);
+                }
+                let headers = String::from_utf8(bytes).unwrap();
+                assert!(headers.starts_with("POST /selected/chat/completions "));
+                assert!(
+                    headers
+                        .to_lowercase()
+                        .contains("authorization: bearer selected-key")
+                );
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse().ok())
+                    })
+                    .unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap()["model"],
+                    "shared"
+                );
+                let body = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let mut agent = AgentHarness::new(config).unwrap();
+        apply_model_metadata(&mut agent, &fetcher, None, saved.base_url.as_deref());
+        assert_eq!(agent.run("first turn").unwrap(), "ok");
+        apply_model_metadata(&mut agent, &fetcher, None, saved.base_url.as_deref());
+        assert_eq!(agent.run("second turn").unwrap(), "ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn provider_menu_uses_saved_names_and_urls_for_legacy_or_explicit_providers() {
+        let providers = vec![SavedProvider {
+            name: "OpenCode Go".to_owned(),
+            base_url: "https://opencode.ai/zen/go/v1".to_owned(),
+            api_key: "test-key".to_owned(),
+        }];
+        let choices = provider_choices(
+            "https://opencode.ai/zen/go/v1;;https://other.example/v1",
+            &providers,
+        );
+        assert_eq!(choices[0].0, "OpenCode Go (https://opencode.ai/zen/go/v1)");
+        assert_eq!(choices[1].0, "https://other.example/v1");
     }
 
     #[test]

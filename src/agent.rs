@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
-use reqwest::blocking::{Client, Response};
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -138,6 +138,23 @@ struct ToolCall {
     arguments: Value,
 }
 
+struct BackgroundTool {
+    call: ToolCall,
+    receiver: Receiver<String>,
+    cancel: CancelToken,
+}
+
+#[derive(Default)]
+struct BackgroundTools(Vec<BackgroundTool>);
+
+impl Drop for BackgroundTools {
+    fn drop(&mut self) {
+        for tool in &self.0 {
+            tool.cancel.cancel();
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Usage {
     prompt_tokens: u64,
@@ -156,6 +173,7 @@ struct ProcessedResponse {
 
 pub struct AgentHarness {
     client: Client,
+    session_id: String,
     endpoints: Vec<ApiEndpoint>,
     model_endpoint_indices: Option<Vec<usize>>,
     pub model: String,
@@ -195,6 +213,7 @@ impl AgentHarness {
         let cancel = tool_registry.cancel.clone();
         Ok(Self {
             client,
+            session_id: new_session_id(),
             endpoints,
             model_endpoint_indices: None,
             model: config.model,
@@ -287,12 +306,16 @@ impl AgentHarness {
                 .push(json!({"role": "user", "content": prompt}));
         }
 
+        let mut background = BackgroundTools::default();
         let result = (|| {
             for turn_index in 0..self.max_turns {
                 if turn_index > 0 {
                     emit(&mut callback, Event::TurnStart);
                 }
                 self.check_cancelled()?;
+                if self.collect_background_results(&mut background, &mut callback) {
+                    rollback_messages = self.messages.clone();
+                }
                 self.trim_history(&mut callback);
                 self.check_cancelled()?;
 
@@ -335,13 +358,30 @@ impl AgentHarness {
                 }
 
                 if processed.tool_calls.is_empty() {
+                    if !background.0.is_empty() {
+                        self.finalize_response(processed.text, stream, &mut callback);
+                        if !self.collect_background_results(&mut background, &mut callback) {
+                            self.wait_for_background_result(&mut background, &mut callback)?;
+                        }
+                        rollback_messages = self.messages.clone();
+                        continue;
+                    }
                     return Ok(self.finalize_response(processed.text, stream, &mut callback));
                 }
 
-                self.handle_tool_calls(processed.text, processed.tool_calls, &mut callback);
+                self.handle_tool_calls(
+                    processed.text,
+                    processed.tool_calls,
+                    &mut background,
+                    &mut callback,
+                );
                 rollback_messages = self.messages.clone();
             }
 
+            while !background.0.is_empty() {
+                self.wait_for_background_result(&mut background, &mut callback)?;
+                rollback_messages = self.messages.clone();
+            }
             Ok(self.finalize_response(
                 Some("Max turns reached without a final response.".to_owned()),
                 stream,
@@ -351,6 +391,13 @@ impl AgentHarness {
 
         if result.is_err() {
             self.messages = rollback_messages;
+            for tool in &background.0 {
+                tool.cancel.cancel();
+                self.messages.push(json!({
+                    "role": "user",
+                    "content": format!("Cancellation requested for background tool call {} ({}) because the agent turn stopped.", tool.call.id, tool.call.name),
+                }));
+            }
         }
         result
     }
@@ -375,15 +422,30 @@ impl AgentHarness {
         }
     }
 
+    fn build_model_request(&self, provider: &ApiEndpoint, body: &Value) -> RequestBuilder {
+        let mut request = self
+            .client
+            .post(format!("{}/chat/completions", provider.base_url))
+            .bearer_auth(&provider.api_key)
+            .json(body);
+        if reqwest::Url::parse(&provider.base_url)
+            .is_ok_and(|url| url.host_str() == Some("opencode.ai"))
+        {
+            request = request
+                .header("x-opencode-session", &self.session_id)
+                .header(
+                    reqwest::header::USER_AGENT,
+                    concat!("harness-rs/", env!("CARGO_PKG_VERSION")),
+                );
+        }
+        request
+    }
+
     fn send_with_retry(&self, body: &Value) -> Result<Response, HarnessError> {
         for attempt in 0..=MAX_RETRIES {
             let endpoint_index = self.endpoint_index_for_attempt(attempt);
             let provider = &self.endpoints[endpoint_index];
-            let request = self
-                .client
-                .post(format!("{}/chat/completions", provider.base_url))
-                .bearer_auth(&provider.api_key)
-                .json(body);
+            let request = self.build_model_request(provider, body);
             let response = cancellable(&self.cancel, move || {
                 request
                     .send()
@@ -416,6 +478,7 @@ impl AgentHarness {
         &mut self,
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
+        background: &mut BackgroundTools,
         callback: &mut Option<&mut Callback<'_>>,
     ) {
         let wire_calls: Vec<Value> = tool_calls
@@ -462,7 +525,29 @@ impl AgentHarness {
                     arguments: call.arguments.clone(),
                 },
             );
-            let result = self.tool_registry.execute(&call.name, &call.arguments);
+            let result = if call.arguments.get("background").and_then(Value::as_bool) == Some(true)
+            {
+                let mut registry = self.tool_registry.clone();
+                registry.cancel = CancelToken::new();
+                let worker_call = call.clone();
+                let (sender, receiver) = mpsc::channel();
+                let cancel = registry.cancel.clone();
+                thread::spawn(move || {
+                    let result = registry.execute(&worker_call.name, &worker_call.arguments);
+                    let _ = sender.send(result);
+                });
+                background.0.push(BackgroundTool {
+                    call: call.clone(),
+                    receiver,
+                    cancel,
+                });
+                format!(
+                    "Background tool call {} started. Its result will be delivered automatically when finished. Continue with other work in the meantime.",
+                    call.id
+                )
+            } else {
+                self.tool_registry.execute(&call.name, &call.arguments)
+            };
             emit(
                 callback,
                 Event::ToolResult {
@@ -475,6 +560,57 @@ impl AgentHarness {
                 "tool_call_id": call.id,
                 "content": result,
             }));
+        }
+    }
+
+    fn collect_background_results(
+        &mut self,
+        background: &mut BackgroundTools,
+        callback: &mut Option<&mut Callback<'_>>,
+    ) -> bool {
+        let mut completed = false;
+        let mut index = 0;
+        while index < background.0.len() {
+            let result = match background.0[index].receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    "Error: background tool worker stopped unexpectedly.".to_owned()
+                }
+            };
+            let tool = background.0.remove(index);
+            self.messages.push(json!({
+                "role": "user",
+                "content": format!("Background tool call {} ({}) finished:\n{}", tool.call.id, tool.call.name, result),
+            }));
+            emit(
+                callback,
+                Event::BackgroundToolResult {
+                    tool_call_id: tool.call.id,
+                    name: tool.call.name,
+                    arguments: tool.call.arguments,
+                    result,
+                },
+            );
+            completed = true;
+        }
+        completed
+    }
+
+    fn wait_for_background_result(
+        &mut self,
+        background: &mut BackgroundTools,
+        callback: &mut Option<&mut Callback<'_>>,
+    ) -> Result<(), HarnessError> {
+        loop {
+            self.check_cancelled()?;
+            if self.collect_background_results(background, callback) {
+                return Ok(());
+            }
+            sleep_cancellable(CANCEL_POLL_INTERVAL, &self.cancel)?;
         }
     }
 
@@ -502,6 +638,7 @@ impl AgentHarness {
 
     pub fn clear_history(&mut self) {
         self.messages.clear();
+        self.session_id = new_session_id();
         self.input_tokens = 0;
         self.output_tokens = 0;
         self.cached_tokens = 0;
@@ -686,6 +823,10 @@ pub(crate) fn split_multi(value: Option<&str>) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn new_session_id() -> String {
+    format!("harness-{:032x}", rand::random::<u128>())
 }
 
 fn build_endpoints(api_key: Option<&str>, base_url: &str) -> Vec<ApiEndpoint> {
@@ -1050,6 +1191,233 @@ mod tests {
     use super::*;
 
     #[test]
+    fn background_calls_continue_and_deliver_results_for_both_response_modes() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        for stream_mode in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut config = AgentConfig::new("test-model");
+            config.base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+            config.working_dir = Some(directory.path().to_owned());
+            config.max_turns = 3;
+            let release = directory.path().join("release");
+            let foreground = directory.path().join("foreground");
+            #[cfg(windows)]
+            let command = "while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Write-Output background-output";
+            #[cfg(not(windows))]
+            let command = "while [ ! -f release ]; do sleep 0.01; done; printf background-output";
+            let server = thread::spawn(move || {
+                for index in 0..3 {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "model request timed out");
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(error) => panic!("{error}"),
+                        }
+                    };
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut headers = Vec::new();
+                    let mut byte = [0];
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        socket.read_exact(&mut byte).unwrap();
+                        headers.push(byte[0]);
+                    }
+                    let headers = String::from_utf8(headers).unwrap();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.parse().ok())
+                        })
+                        .unwrap();
+                    let mut body = vec![0; length];
+                    socket.read_exact(&mut body).unwrap();
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let message = match index {
+                        0 => json!({"content": null, "tool_calls": [
+                            {"id": "bg-1", "type": "function", "function": {
+                                "name": "bash", "arguments": json!({"command": command, "background": true}).to_string()
+                            }},
+                            {"id": "fg-1", "type": "function", "function": {
+                                "name": "write", "arguments": json!({"path": "foreground", "content": "done"}).to_string()
+                            }}
+                        ]}),
+                        1 => {
+                            assert!(foreground.exists());
+                            let messages = body["messages"].as_array().unwrap();
+                            assert!(
+                                messages
+                                    .iter()
+                                    .any(|message| message["tool_call_id"] == "bg-1"
+                                        && message["content"]
+                                            .as_str()
+                                            .unwrap()
+                                            .contains("started"))
+                            );
+                            assert!(!messages.iter().any(|message| {
+                                message["content"]
+                                    .as_str()
+                                    .is_some_and(|content| content.contains("background-output"))
+                                    && message["role"] == "user"
+                            }));
+                            std::fs::write(&release, "done").unwrap();
+                            json!({"content": "Other work finished."})
+                        }
+                        _ => {
+                            assert!(body["messages"].as_array().unwrap().iter().any(|message| {
+                                message["role"] == "user"
+                                    && message["content"].as_str().is_some_and(|content| {
+                                        content.contains("bg-1 (bash) finished:")
+                                            && content.contains("background-output")
+                                    })
+                            }));
+                            json!({"content": "All work finished."})
+                        }
+                    };
+                    let finish = if index == 0 { "tool_calls" } else { "stop" };
+                    let payload = if stream_mode {
+                        let mut delta = message.clone();
+                        if let Some(calls) = delta["tool_calls"].as_array_mut() {
+                            for (index, call) in calls.iter_mut().enumerate() {
+                                call["index"] = json!(index);
+                            }
+                        }
+                        format!(
+                            "data: {}\n\ndata: [DONE]\n\n",
+                            json!({"choices": [{"delta": delta, "finish_reason": finish}]})
+                        )
+                    } else {
+                        json!({"choices": [{"message": message, "finish_reason": finish}]})
+                            .to_string()
+                    };
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        if stream_mode { "text/event-stream" } else { "application/json" }, payload.len(), payload).unwrap();
+                }
+            });
+            let mut agent = AgentHarness::new(config).unwrap();
+            let mut events = Vec::new();
+            let response = agent
+                .run_with_callback("Do the work", stream_mode, &mut |event| {
+                    events.push(event.clone())
+                })
+                .unwrap();
+            server.join().unwrap();
+            assert_eq!(response, "All work finished.");
+            assert!(events.iter().any(|event| matches!(event, Event::ToolCall { arguments, .. } if arguments["background"] == true)));
+            assert!(events.iter().any(
+                |event| matches!(event, Event::BackgroundToolResult { tool_call_id, result, .. }
+                if tool_call_id == "bg-1" && result.contains("background-output"))
+            ));
+        }
+    }
+
+    #[test]
+    fn background_completions_keep_call_ids_and_arguments_even_out_of_order() {
+        let mut agent = AgentHarness::new(AgentConfig::new("test-model")).unwrap();
+        let mut background = BackgroundTools::default();
+        let mut senders = Vec::new();
+        for id in ["first", "second"] {
+            let (sender, receiver) = mpsc::channel();
+            senders.push(sender);
+            background.0.push(BackgroundTool {
+                call: ToolCall {
+                    id: id.to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({"path": id, "background": true}),
+                },
+                receiver,
+                cancel: CancelToken::new(),
+            });
+        }
+        senders[1].send("Error: missing file".to_owned()).unwrap();
+        let mut events = Vec::new();
+        let mut callback = |event: &Event| events.push(event.clone());
+        assert!(agent.collect_background_results(&mut background, &mut Some(&mut callback)));
+        assert_eq!(background.0[0].call.id, "first");
+        senders[0].send("first-output".to_owned()).unwrap();
+        assert!(agent.collect_background_results(&mut background, &mut Some(&mut callback)));
+        assert!(background.0.is_empty());
+        assert!(
+            matches!(&events[0], Event::BackgroundToolResult { tool_call_id, arguments, result, .. }
+            if tool_call_id == "second" && arguments["path"] == "second" && result == "Error: missing file")
+        );
+        assert!(
+            matches!(&events[1], Event::BackgroundToolResult { tool_call_id, result, .. }
+            if tool_call_id == "first" && result == "first-output")
+        );
+    }
+
+    #[test]
+    fn cancelling_a_background_wait_stops_workers_without_reusing_the_turn_token() {
+        let mut agent = AgentHarness::new(AgentConfig::new("test-model")).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let worker_cancel = CancelToken::new();
+        let mut background = BackgroundTools(vec![BackgroundTool {
+            call: ToolCall {
+                id: "bg".into(),
+                name: "bash".into(),
+                arguments: json!({}),
+            },
+            receiver,
+            cancel: worker_cancel.clone(),
+        }]);
+        agent.cancel.cancel();
+        assert!(matches!(
+            agent.wait_for_background_result(&mut background, &mut None),
+            Err(HarnessError::Cancelled)
+        ));
+        drop(background);
+        agent.cancel.reset();
+        assert!(worker_cancel.is_cancelled());
+        drop(sender);
+    }
+
+    #[test]
+    fn foreground_calls_complete_synchronously_by_default_and_when_false() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::new("test-model");
+        config.working_dir = Some(directory.path().to_owned());
+        let mut agent = AgentHarness::new(config).unwrap();
+        for arguments in [
+            json!({"path": "file", "content": "default"}),
+            json!({"path": "file", "content": "false", "background": false}),
+        ] {
+            let mut background = BackgroundTools::default();
+            agent.handle_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: "fg".into(),
+                    name: "write".into(),
+                    arguments: arguments.clone(),
+                }],
+                &mut background,
+                &mut None,
+            );
+            assert!(background.0.is_empty());
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join("file")).unwrap(),
+                arguments["content"].as_str().unwrap()
+            );
+            assert!(
+                agent.messages.last().unwrap()["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Successfully wrote")
+            );
+        }
+    }
+
+    #[test]
     fn parses_text_reasoning_tools_and_usage() {
         let response = json!({
             "choices": [{
@@ -1178,6 +1546,61 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn opencode_requests_share_a_session_until_history_is_cleared() {
+        let mut config = AgentConfig::new("test-model");
+        config.base_url = "https://opencode.ai/zen/v1;;https://opencode.ai/zen/go/v1".to_owned();
+        let mut agent = AgentHarness::new(config).unwrap();
+        let session = agent.session_id.clone();
+        for endpoint in &agent.endpoints {
+            for body in [
+                json!({"stream": false}),
+                json!({"stream": true}),
+                json!({"messages": [{"role": "user", "content": "Summarize"}]}),
+            ] {
+                let request = agent.build_model_request(endpoint, &body).build().unwrap();
+                assert_eq!(request.headers()["x-opencode-session"], session);
+                assert_eq!(
+                    request.headers()[reqwest::header::USER_AGENT],
+                    concat!("harness-rs/", env!("CARGO_PKG_VERSION"))
+                );
+            }
+        }
+        agent.select_model("another-model", Some(vec![1]));
+        agent.add_provider("https://opencode.ai/zen/go/v1", "updated-key");
+        assert_eq!(agent.session_id, session);
+        let other_agent = AgentHarness::new(AgentConfig::new("test-model")).unwrap();
+        assert_ne!(other_agent.session_id, session);
+        agent.clear_history();
+        assert_ne!(agent.session_id, session);
+        let request = agent
+            .build_model_request(&agent.endpoints[0], &json!({}))
+            .build()
+            .unwrap();
+        assert_eq!(request.headers()["x-opencode-session"], agent.session_id);
+    }
+
+    #[test]
+    fn unrelated_providers_do_not_receive_opencode_headers() {
+        let agent = AgentHarness::new(AgentConfig::new("test-model")).unwrap();
+        for base_url in [
+            "https://api.openai.com/v1",
+            "https://opencode.ai.example/v1",
+            "https://example.com/opencode.ai",
+        ] {
+            let endpoint = ApiEndpoint {
+                base_url: base_url.to_owned(),
+                api_key: "key".to_owned(),
+            };
+            let request = agent
+                .build_model_request(&endpoint, &json!({}))
+                .build()
+                .unwrap();
+            assert!(!request.headers().contains_key("x-opencode-session"));
+            assert!(!request.headers().contains_key(reqwest::header::USER_AGENT));
+        }
     }
 
     #[test]

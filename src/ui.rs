@@ -21,10 +21,10 @@ pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦"
 /// Slash commands with their help text, in display order.
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show commands and shortcuts"),
-    ("/models", "Browse and switch models"),
+    ("/models", "Choose a provider and model"),
     ("/model", "Browse and switch models (alias)"),
     ("/reasoning", "Set the reasoning effort"),
-    ("/login", "Add an OpenAI-compatible provider"),
+    ("/login", "Add a named OpenAI-compatible provider"),
     ("/context", "Attach custom context to the system prompt"),
     ("/context show", "Show the custom context"),
     ("/context clear", "Remove the custom context"),

@@ -40,6 +40,12 @@ pub enum Event {
         name: String,
         result: String,
     },
+    BackgroundToolResult {
+        tool_call_id: String,
+        name: String,
+        arguments: Value,
+        result: String,
+    },
     TurnStart,
     FinishReason {
         reason: String,
